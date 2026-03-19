@@ -514,7 +514,7 @@ class WaveletLoss(nn.Module):
         pred_subbands = self.dwt(pred)
         target_subbands = self.dwt(target)
         
-        loss = 0
+        loss = torch.tensor(0.0, device=pred.device, dtype=pred.dtype)
         for w, p_sub, t_sub in zip(self.weights, pred_subbands, target_subbands):
             loss = loss + w * F.l1_loss(p_sub, t_sub)
         

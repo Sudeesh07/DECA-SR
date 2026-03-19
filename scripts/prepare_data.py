@@ -9,6 +9,13 @@ import numpy as np
 from PIL import Image
 from tqdm import tqdm
 
+def _bicubic_resample():
+    # Pillow >= 9 uses Image.Resampling, older versions keep Image.BICUBIC.
+    resampling = getattr(Image, "Resampling", None)
+    if resampling is not None:
+        return resampling.BICUBIC
+    return getattr(Image, "BICUBIC")
+
 
 def create_lr_images(hr_dir: str, lr_dir: str, scale: int):
     os.makedirs(lr_dir, exist_ok=True)
@@ -21,7 +28,7 @@ def create_lr_images(hr_dir: str, lr_dir: str, scale: int):
         w, h = img.size
         lr_w, lr_h = w // scale, h // scale
         img = img.crop((0, 0, lr_w * scale, lr_h * scale))
-        lr_img = img.resize((lr_w, lr_h), Image.BICUBIC)
+        lr_img = img.resize((lr_w, lr_h), _bicubic_resample())
 
         out_path = os.path.join(lr_dir, os.path.basename(path))
         lr_img.save(out_path, quality=95)
@@ -103,43 +110,64 @@ def generate_lr_for_dataset(data_dir: str, scales=(2, 4)):
                 create_lr_images(hr_dir, lr_dir, scale)
 
 
-def verify_dataset(data_dir: str):
-    print(f"\nVerifying: {data_dir}")
+def verify_stereo_sr_dataset(root):
+    print(f"\nVerifying StereoSR dataset: {root}")
     issues = 0
 
-    for split in ["train", "val", "test"]:
-        split_dir = os.path.join(data_dir, split)
-        if not os.path.exists(split_dir):
-            print(f"  ⚠ Missing split: {split}")
+    # ---- TRAIN (patches) ----
+    for scale in [2, 4]:
+        patch_dir = os.path.join(root, f"patches_x{scale}")
+        if not os.path.exists(patch_dir):
+            print(f"  ⚠ Missing {patch_dir}")
             continue
-        hr_left = sorted(glob.glob(os.path.join(split_dir, "hr", "left", "*")))
-        hr_right = sorted(glob.glob(os.path.join(split_dir, "hr", "right", "*")))
 
-        print(f"  {split}: {len(hr_left)} left, {len(hr_right)} right HR images")
+        scenes = sorted(os.listdir(patch_dir))
+        print(f"  patches_x{scale}: {len(scenes)} samples")
 
-        if len(hr_left) != len(hr_right):
-            print(f"    ✗ Mismatched counts!")
-            issues += 1
-        if hr_left and hr_right:
-            img_l = Image.open(hr_left[0])
-            img_r = Image.open(hr_right[0])
-            if img_l.size != img_r.size:
-                print(f"    ✗ Size mismatch: {img_l.size} vs {img_r.size}")
-                issues += 1
-            else:
-                print(f"    ✓ Image size: {img_l.size}")
-        for scale in [2, 4]:
-            lr_dir = os.path.join(split_dir, f"lr_x{scale}", "left")
-            if os.path.exists(lr_dir):
-                n_lr = len(glob.glob(os.path.join(lr_dir, "*")))
-                print(f"    LR x{scale}: {n_lr} images")
-            else:
-                print(f"    LR x{scale}: not generated (will be created on-the-fly)")
+        for scene in scenes[:5]:  # check few samples
+            scene_path = os.path.join(patch_dir, scene)
+            files = os.listdir(scene_path)
+
+            required = ["hr0", "hr1", "lr0", "lr1"]
+            found = [os.path.splitext(f)[0] for f in files]
+
+            for r in required:
+                if r not in found:
+                    print(f"    ✗ Missing {r} in {scene}")
+                    issues += 1
+
+    # ---- TEST ----
+    test_root = os.path.join(root, "test")
+    if os.path.exists(test_root):
+        datasets = os.listdir(test_root)
+
+        for ds in datasets:
+            print(f"\n  Testing dataset: {ds}")
+            hr_dir = os.path.join(test_root, ds, "hr")
+
+            scenes = os.listdir(hr_dir)
+            print(f"    {len(scenes)} scenes")
+
+            for scene in scenes[:5]:
+                hr_scene = os.path.join(hr_dir, scene)
+                files = os.listdir(hr_scene)
+
+                if not ("hr0.png" in files and "hr1.png" in files):
+                    print(f"    ✗ Missing HR pair in {scene}")
+                    issues += 1
+
+                for scale in [2, 4]:
+                    lr_scene = os.path.join(test_root, ds, f"lr_x{scale}", scene)
+                    if os.path.exists(lr_scene):
+                        lr_files = os.listdir(lr_scene)
+                        if not ("lr0.png" in lr_files and "lr1.png" in lr_files):
+                            print(f"    ✗ Missing LR x{scale} in {scene}")
+                            issues += 1
 
     if issues == 0:
-        print("  ✓ Dataset OK!")
+        print("\n✅ Dataset looks good!")
     else:
-        print(f"  ✗ {issues} issue(s) found")
+        print(f"\n❌ Found {issues} issue(s)")
 
 
 if __name__ == "__main__":
@@ -156,7 +184,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     if args.verify:
-        verify_dataset(args.output)
+        verify_stereo_sr_dataset(args.output)
     elif args.generate_lr:
         generate_lr_for_dataset(args.output)
     elif args.dataset == "flickr1024":

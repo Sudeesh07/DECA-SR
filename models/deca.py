@@ -1,14 +1,5 @@
 """
 DECA: Deformable Epipolar Cross-Attention for Stereo Image Super-Resolution
-
-Fixed version addressing:
-1. Correlation now computed across multiple horizontal shifts (not just zero disparity)
-3. Memory-efficient grid sampling with loop instead of repeat_for_k
-5. BidirectionalDECA properly negates offsets for R->L instead of relying on flip trick
-6. Offset predictor now receives left features for better context in textureless regions
-7. Learnable attention temperature instead of fixed scale
-
-No external dependencies (pure PyTorch).
 """
 
 import torch
@@ -41,7 +32,7 @@ def rearrange_sampled_to_multihead(x: torch.Tensor, B: int, K: int, num_heads: i
 def rearrange_back_to_spatial(x: torch.Tensor, H: int, W: int) -> torch.Tensor:
     """[B, num_heads, head_dim, H*W] -> [B, C, H, W]"""
     B, num_heads, head_dim, N = x.shape
-    return x.view(B, num_heads * head_dim, H, W)
+    return x.reshape(B, num_heads * head_dim, H, W)
 
 
 class LayerNorm2d(nn.Module):
@@ -77,7 +68,7 @@ class DECAOffsetPredictor(nn.Module):
         self,
         channels: int,
         k: int = 8,
-        max_disparity: int = 192,
+        max_disparity: int = 32,
         num_corr_shifts: int = 9,
     ):
         super().__init__()
@@ -85,7 +76,10 @@ class DECAOffsetPredictor(nn.Module):
         self.max_disparity = max_disparity
         self.num_corr_shifts = num_corr_shifts
 
-        reduced = channels // 4
+        if num_corr_shifts < 1:
+            raise ValueError(f"num_corr_shifts must be >= 1, got {num_corr_shifts}")
+
+        reduced = max(1, channels // 4)
 
         # Lightweight projections for correlation
         self.query_proj = nn.Conv2d(channels, reduced, 1)
@@ -109,6 +103,7 @@ class DECAOffsetPredictor(nn.Module):
 
         # Initialize to zero offsets, bias spread across disparity range
         nn.init.zeros_(self.offset_head.weight)
+        assert self.offset_head.bias is not None
         nn.init.zeros_(self.offset_head.bias)
         with torch.no_grad():
             self.offset_head.bias.copy_(
@@ -117,10 +112,10 @@ class DECAOffsetPredictor(nn.Module):
 
         # Precompute the shift values (centered around 0, spaced across a local window)
         # These are pixel-level shifts for building a mini cost volume
-        max_shift = max_disparity // 4  # e.g., 48 pixels for max_disparity=192
+        max_shift = max(1, max_disparity // 4)
         self.register_buffer(
             'shifts',
-            torch.linspace(-max_shift, max_shift, num_corr_shifts).long()
+            torch.round(torch.linspace(-max_shift, max_shift, num_corr_shifts)).long()
         )
 
     def forward(self, f_left: torch.Tensor, f_right: torch.Tensor) -> torch.Tensor:
@@ -141,8 +136,9 @@ class DECAOffsetPredictor(nn.Module):
         # This builds a mini cost volume that captures stereo matching signal
         # across different disparities, not just at zero offset.
         corr_planes = []
-        for shift in self.shifts:
-            shift_val = shift.item()
+        shifts = getattr(self, 'shifts')
+        for shift in shifts:
+            shift_val = int(shift.item())
             if shift_val == 0:
                 k_shifted = k
             elif shift_val > 0:
@@ -157,7 +153,7 @@ class DECAOffsetPredictor(nn.Module):
                 k_shifted = k_shifted[:, :, :, :W]
 
             # Dot product correlation at this shift, summed over channels -> [B, 1, H, W]
-            corr_at_shift = (q * k_shifted).sum(dim=1, keepdim=True)
+            corr_at_shift = (q * k_shifted).sum(dim=1, keepdim=True) * (q.shape[1] ** -0.5)
             corr_planes.append(corr_at_shift)
 
         corr = torch.cat(corr_planes, dim=1)  # [B, num_corr_shifts, H, W]
@@ -190,7 +186,7 @@ class DECA(nn.Module):
         channels: Number of feature channels
         k: Number of sampling points per query (default: 8)
         num_heads: Number of attention heads (default: 4)
-        max_disparity: Maximum disparity in pixels (default: 192)
+        max_disparity: Maximum disparity in pixels (default: 32)
         use_occlusion_gate: Whether to use soft occlusion gating (default: False)
         num_corr_shifts: Number of horizontal shifts for offset predictor correlation
     """
@@ -199,7 +195,7 @@ class DECA(nn.Module):
         channels: int,
         k: int = 8,
         num_heads: int = 4,
-        max_disparity: int = 192,
+        max_disparity: int = 32,
         use_occlusion_gate: bool = False,
         num_corr_shifts: int = 9,
     ):
@@ -244,9 +240,6 @@ class DECA(nn.Module):
             torch.tensor(self.head_dim ** -0.5).log()
         )
 
-        # Pre-register base grid components (will be expanded in forward)
-        self.register_buffer('_grid_initialized', torch.tensor(False))
-
     def _get_sampling_grid_single(
         self,
         offsets_k: torch.Tensor,
@@ -272,8 +265,11 @@ class DECA(nn.Module):
         grid_x = torch.linspace(-1, 1, W, device=device)
         base_y, base_x = torch.meshgrid(grid_y, grid_x, indexing="ij")
 
-        # Normalize offsets to [-1, 1] range
-        offset_norm = offsets_k * (2.0 / W)  # [B, H, W]
+        # Normalize offsets to [-1, 1] range (guard W == 1)
+        if W > 1:
+            offset_norm = offsets_k * (2.0 / (W - 1))  # [B, H, W]
+        else:
+            offset_norm = torch.zeros_like(offsets_k)
 
         # Compute sampled x coordinates
         sample_x = base_x.unsqueeze(0) + offset_norm  # [B, H, W]
@@ -325,11 +321,11 @@ class DECA(nn.Module):
 
             ks = F.grid_sample(
                 keys, grid_i,
-                mode='bilinear', padding_mode='border', align_corners=True
+                mode='bilinear', padding_mode='zeros', align_corners=True
             )  # [B, C, H, W]
             vs = F.grid_sample(
                 values, grid_i,
-                mode='bilinear', padding_mode='border', align_corners=True
+                mode='bilinear', padding_mode='zeros', align_corners=True
             )  # [B, C, H, W]
             keys_sampled_list.append(ks)
             vals_sampled_list.append(vs)
@@ -388,7 +384,7 @@ class BidirectionalDECA(nn.Module):
         channels: int,
         k: int = 8,
         num_heads: int = 4,
-        max_disparity: int = 192,
+        max_disparity: int = 32,
         use_occlusion_gate: bool = False,
         num_corr_shifts: int = 9,
     ):
@@ -485,7 +481,7 @@ def test_deca():
     predictor = deca.offset_predictor
     offsets_test = predictor(f_left, f_right)
     assert offsets_test.shape == (B, 8, H, W), f"Offset shape: {offsets_test.shape}"
-    assert offsets_test.abs().max() <= 192, "Offsets should be clamped"
+    assert offsets_test.abs().max() <= deca.max_disparity, "Offsets should be clamped"
     print(f"✓ Offset predictor output: {offsets_test.shape}, range [{offsets_test.min():.1f}, {offsets_test.max():.1f}]")
 
     print("\nAll tests passed! ✓")

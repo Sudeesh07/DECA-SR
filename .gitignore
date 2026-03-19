@@ -88,6 +88,8 @@ htmlcov/
 .coverage
 .coverage.*
 
+experiments/
+
 # Misc
 
 *.swp

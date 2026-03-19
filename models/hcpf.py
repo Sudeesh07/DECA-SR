@@ -14,21 +14,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Tuple, Optional
-
-
-class LayerNorm2d(nn.Module):
-    """Channel-wise layer normalization for 2D feature maps."""
-    def __init__(self, channels: int, eps: float = 1e-6):
-        super().__init__()
-        self.weight = nn.Parameter(torch.ones(channels))
-        self.bias = nn.Parameter(torch.zeros(channels))
-        self.eps = eps
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        mean = x.mean(dim=1, keepdim=True)
-        var = x.var(dim=1, keepdim=True, unbiased=False)
-        return self.weight.view(1, -1, 1, 1) * (x - mean) / (var + self.eps).sqrt() + self.bias.view(1, -1, 1, 1)
-
+from .deca import DECA, LayerNorm2d
 
 class GroupWiseCorrelation(nn.Module):
     """
@@ -88,7 +74,7 @@ class GroupWiseCorrelation(nn.Module):
 
         # Build correlation volume efficiently
         # Pre-allocate output tensor
-        corr_vol = f_left.new_zeros(B, G * max_d, H, W)
+        corr_vol = f_left.new_zeros(B, G * self.max_disp, H, W)
         
         for d in range(max_d):
             if d == 0:
@@ -101,7 +87,7 @@ class GroupWiseCorrelation(nn.Module):
                 # Pad left side (occluded region) with zeros
                 corr = F.pad(corr, (d, 0), mode='constant', value=0)
             
-            corr_vol[:, d*G:(d+1)*G, :, :] = corr
+            corr_vol[:, d * G:(d + 1) * G, :, :] = corr
         
         # Aggregate to feature space
         out = self.aggregate(corr_vol)
@@ -157,6 +143,12 @@ class GroupWiseCorrelationVectorized(nn.Module):
         
         # Rearrange to [B, G*D, H, W]
         corr = corr.permute(0, 1, 3, 2, 4).reshape(B, G * D, H, W)
+
+        # Keep aggregate input channels fixed at num_groups * self.max_disp.
+        if D < self.max_disp:
+            corr_padded = f_left.new_zeros(B, G * self.max_disp, H, W)
+            corr_padded[:, :G * D, :, :] = corr
+            corr = corr_padded
         
         # Aggregate
         out = self.aggregate(corr)
@@ -240,104 +232,6 @@ class FullEpipolarAttention(nn.Module):
         return f_left + out * self.beta
 
 
-class DECA(nn.Module):
-    """
-    Deformable Epipolar Cross-Attention (simplified version).
-    
-    For full implementation, see deca_improved.py
-    """
-    def __init__(self, channels: int, k: int = 8, num_heads: int = 4, max_disparity: int = 96):
-        super().__init__()
-        self.channels = channels
-        self.k = k
-        self.num_heads = num_heads
-        self.head_dim = channels // num_heads
-        self.max_disparity = max_disparity
-        
-        self.norm_l = LayerNorm2d(channels)
-        self.norm_r = LayerNorm2d(channels)
-        
-        self.q_proj = nn.Conv2d(channels, channels, 1)
-        self.k_proj = nn.Conv2d(channels, channels, 1)
-        self.v_proj = nn.Conv2d(channels, channels, 1)
-        
-        # Offset predictor
-        self.offset_net = nn.Sequential(
-            nn.Conv2d(channels, channels // 4, 1),
-            nn.GELU(),
-            nn.Conv2d(channels // 4, channels // 4, 3, padding=1, groups=channels // 4),
-            nn.GELU(),
-            nn.Conv2d(channels // 4, k, 1),
-        )
-        
-        # Initialize offsets
-        nn.init.zeros_(self.offset_net[-1].weight)
-        nn.init.zeros_(self.offset_net[-1].bias)
-        with torch.no_grad():
-            self.offset_net[-1].bias.copy_(torch.linspace(-max_disparity//2, max_disparity//2, k))
-        
-        self.out_proj = nn.Conv2d(channels, channels, 1)
-        self.scale = self.head_dim ** -0.5
-        self.beta = nn.Parameter(torch.zeros(1, channels, 1, 1))
-
-    def forward(self, f_left: torch.Tensor, f_right: torch.Tensor) -> torch.Tensor:
-        B, C, H, W = f_left.shape
-        
-        fl = self.norm_l(f_left)
-        fr = self.norm_r(f_right)
-        
-        # Predict offsets
-        corr = fl * fr  # Simple correlation
-        offsets = self.offset_net(corr)  # [B, K, H, W]
-        offsets = offsets.clamp(-self.max_disparity, self.max_disparity)
-        
-        # Project Q, K, V
-        q = self.q_proj(fl)
-        k = self.k_proj(fr)
-        v = self.v_proj(fr)
-        
-        # Create sampling grid
-        grid_y = torch.linspace(-1, 1, H, device=f_left.device)
-        grid_x = torch.linspace(-1, 1, W, device=f_left.device)
-        base_y, base_x = torch.meshgrid(grid_y, grid_x, indexing='ij')
-        base_y = base_y.unsqueeze(0).expand(B, -1, -1)
-        base_x = base_x.unsqueeze(0).expand(B, -1, -1)
-        
-        # Sample K and V at offset positions
-        sampled_k_list = []
-        sampled_v_list = []
-        
-        for ki in range(self.k):
-            offset_x = offsets[:, ki] * (2.0 / W)
-            sample_x = (base_x + offset_x).clamp(-1, 1)
-            grid = torch.stack([sample_x, base_y], dim=-1)
-            
-            sampled_k = F.grid_sample(k, grid, mode='bilinear', padding_mode='border', align_corners=True)
-            sampled_v = F.grid_sample(v, grid, mode='bilinear', padding_mode='border', align_corners=True)
-            
-            sampled_k_list.append(sampled_k)
-            sampled_v_list.append(sampled_v)
-        
-        # Stack: [B, C, H, W, K]
-        sampled_k = torch.stack(sampled_k_list, dim=-1)
-        sampled_v = torch.stack(sampled_v_list, dim=-1)
-        
-        # Reshape for attention
-        q = q.view(B, self.num_heads, self.head_dim, H * W)
-        sampled_k = sampled_k.view(B, self.num_heads, self.head_dim, H * W, self.k)
-        sampled_v = sampled_v.view(B, self.num_heads, self.head_dim, H * W, self.k)
-        
-        # Compute attention
-        attn = torch.einsum('bhdn,bhdnk->bhnk', q, sampled_k) * self.scale
-        attn = attn.softmax(dim=-1)
-        
-        # Apply attention
-        out = torch.einsum('bhnk,bhdnk->bhdn', attn, sampled_v)
-        out = out.view(B, C, H, W)
-        
-        out = self.out_proj(out)
-        
-        return f_left + out * self.beta
 
 
 class HCPF(nn.Module):
@@ -460,6 +354,13 @@ class HCPF(nn.Module):
         coarse_guide = self.coarse_to_mid(coarse_out)
         if self.use_learned_upsampling:
             coarse_guide_up = self.up_4(coarse_guide)
+            if coarse_guide_up.shape[-2:] != fl_2.shape[-2:]:
+                coarse_guide_up = F.interpolate(
+                    coarse_guide_up,
+                    size=fl_2.shape[-2:],
+                    mode='bilinear',
+                    align_corners=False,
+                )
         else:
             coarse_guide_up = F.interpolate(coarse_guide, size=(H//2, W//2), mode='bilinear', align_corners=False)
 
@@ -471,6 +372,13 @@ class HCPF(nn.Module):
         mid_guide = self.mid_to_fine(mid_out)
         if self.use_learned_upsampling:
             mid_guide_up = self.up_2(mid_guide)
+            if mid_guide_up.shape[-2:] != f_left.shape[-2:]:
+                mid_guide_up = F.interpolate(
+                    mid_guide_up,
+                    size=f_left.shape[-2:],
+                    mode='bilinear',
+                    align_corners=False,
+                )
         else:
             mid_guide_up = F.interpolate(mid_guide, size=(H, W), mode='bilinear', align_corners=False)
 
