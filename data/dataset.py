@@ -45,7 +45,8 @@ class StereoSRDataset(Dataset):
     Args:
         data_root: Path to the StereoSR root directory
         scale: Super-resolution scale factor (2 or 4)
-        patch_size: Crop size for training (in LR space). Ignored for test.
+        patch_h: Crop height for training (in LR space). Ignored for test.
+        patch_w: Crop width for training (in LR space). Ignored for test.
         augment: Whether to apply data augmentation (training only)
         is_train: If True, loads from patches_x{scale}. If False, loads from test.
         test_source: Which test set to use, e.g. "Flickr1024", "KITTI2012", etc.
@@ -56,7 +57,8 @@ class StereoSRDataset(Dataset):
         self,
         data_root: str,
         scale: int = 4,
-        patch_size: int = 64,
+        patch_h: int = 30,
+        patch_w: int = 90,
         augment: bool = True,
         is_train: bool = True,
         test_source: Optional[str] = None,
@@ -64,7 +66,8 @@ class StereoSRDataset(Dataset):
         super().__init__()
         self.data_root = data_root
         self.scale = scale
-        self.patch_size = patch_size
+        self.patch_h = patch_h
+        self.patch_w = patch_w
         self.augment = augment and is_train
         self.is_train = is_train
         self.test_source = test_source
@@ -232,26 +235,27 @@ class StereoSRDataset(Dataset):
         lr_right: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Random crop in LR space, mapped to HR space for strict alignment."""
+        ph, pw = self.patch_h, self.patch_w
+
+        lr_left = self._safe_pad(lr_left, ph, pw)
+        lr_right = self._safe_pad(lr_right, ph, pw)
         _, lr_h, lr_w = lr_left.shape
 
-        lr_left = self._safe_pad(lr_left, self.patch_size, self.patch_size)
-        lr_right = self._safe_pad(lr_right, self.patch_size, self.patch_size)
-        _, lr_h, lr_w = lr_left.shape
+        top_lr = random.randint(0, lr_h - ph)
+        left_lr = random.randint(0, lr_w - pw)
 
-        top_lr = random.randint(0, lr_h - self.patch_size)
-        left_lr = random.randint(0, lr_w - self.patch_size)
-
-        hr_patch = self.patch_size * self.scale
+        hr_ph = ph * self.scale
+        hr_pw = pw * self.scale
         top_hr = top_lr * self.scale
         left_hr = left_lr * self.scale
 
-        hr_left = self._safe_pad(hr_left, top_hr + hr_patch, left_hr + hr_patch)
-        hr_right = self._safe_pad(hr_right, top_hr + hr_patch, left_hr + hr_patch)
+        hr_left = self._safe_pad(hr_left, top_hr + hr_ph, left_hr + hr_pw)
+        hr_right = self._safe_pad(hr_right, top_hr + hr_ph, left_hr + hr_pw)
 
-        lr_left = self._crop(lr_left, top_lr, left_lr, self.patch_size, self.patch_size)
-        lr_right = self._crop(lr_right, top_lr, left_lr, self.patch_size, self.patch_size)
-        hr_left = self._crop(hr_left, top_hr, left_hr, hr_patch, hr_patch)
-        hr_right = self._crop(hr_right, top_hr, left_hr, hr_patch, hr_patch)
+        lr_left = self._crop(lr_left, top_lr, left_lr, ph, pw)
+        lr_right = self._crop(lr_right, top_lr, left_lr, ph, pw)
+        hr_left = self._crop(hr_left, top_hr, left_hr, hr_ph, hr_pw)
+        hr_right = self._crop(hr_right, top_hr, left_hr, hr_ph, hr_pw)
 
         return hr_left, hr_right, lr_left, lr_right
 
@@ -297,43 +301,38 @@ class StereoSRDataset(Dataset):
 
         hr_left = self._load_image(sample["hr_left"])
         hr_right = self._load_image(sample["hr_right"])
-        lr_left = self._load_image(sample["lr_left"])
-        lr_right = self._load_image(sample["lr_right"])
+
         has_lr = "lr_left" in sample and "lr_right" in sample
+        lr_left: Optional[torch.Tensor] = self._load_image(sample["lr_left"]) if has_lr else None
+        lr_right: Optional[torch.Tensor] = self._load_image(sample["lr_right"]) if has_lr else None
 
-
+        # Generate LR from HR if not provided (test samples without LR)
+        if lr_left is None or lr_right is None:
+            _, h, w = hr_left.shape
+            lr_h = h // self.scale
+            lr_w = w // self.scale
+            hr_left = hr_left[:, : lr_h * self.scale, : lr_w * self.scale]
+            hr_right = hr_right[:, : lr_h * self.scale, : lr_w * self.scale]
+            lr_left = TF.resize(
+                hr_left,
+                [lr_h, lr_w],
+                interpolation=TF.InterpolationMode.BICUBIC,
+                antialias=True,
+            )
+            lr_right = TF.resize(
+                hr_right,
+                [lr_h, lr_w],
+                interpolation=TF.InterpolationMode.BICUBIC,
+                antialias=True,
+            )
 
         if self.is_train:
-            # Training patches already have LR images, but may need re-cropping
-            # if patch_size differs from the stored patch size
-            if lr_left is not None:
-                hr_left, hr_right, lr_left, lr_right = self._paired_random_crop(
-                    hr_left, hr_right, lr_left, lr_right
-                )
+            hr_left, hr_right, lr_left, lr_right = self._paired_random_crop(
+                hr_left, hr_right, lr_left, lr_right
+            )
             if self.augment:
                 hr_left, hr_right, lr_left, lr_right = self._augment(
                     hr_left, hr_right, lr_left, lr_right
-                )
-        else:
-            # Test: use provided LR or generate by downsampling
-            if lr_left is None or lr_right is None:
-                _, h, w = hr_left.shape
-                lr_h = h // self.scale
-                lr_w = w // self.scale
-                # Crop HR to be exactly divisible by scale
-                hr_left = hr_left[:, : lr_h * self.scale, : lr_w * self.scale]
-                hr_right = hr_right[:, : lr_h * self.scale, : lr_w * self.scale]
-                lr_left = TF.resize(
-                    hr_left,
-                    [lr_h, lr_w],
-                    interpolation=TF.InterpolationMode.BICUBIC,
-                    antialias=True,
-                )
-                lr_right = TF.resize(
-                    hr_right,
-                    [lr_h, lr_w],
-                    interpolation=TF.InterpolationMode.BICUBIC,
-                    antialias=True,
                 )
 
         lr_left = lr_left.clamp(0, 1)
@@ -372,7 +371,8 @@ def build_dataset(args, split: str = "train") -> StereoSRDataset:
     Expected args attributes:
         args.data_root:   Path to StereoSR root
         args.scale:       SR scale factor (2 or 4)
-        args.patch_size:  Training patch size in LR space
+        args.patch_h:     Training patch height in LR space
+        args.patch_w:     Training patch width in LR space
         args.augment:     Whether to augment (bool)
         args.test_source: Test dataset name, e.g. "Flickr1024" (for val/test)
     """
@@ -380,7 +380,8 @@ def build_dataset(args, split: str = "train") -> StereoSRDataset:
         return StereoSRDataset(
             data_root=args.data_root,
             scale=args.scale,
-            patch_size=args.patch_size,
+            patch_h=args.patch_h,
+            patch_w=args.patch_w,
             augment=args.augment,
             is_train=True,
         )

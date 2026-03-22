@@ -1,3 +1,7 @@
+'''
+TCVA: Temporal Cross-View Attention for Video Super-Resolution
+'''
+
 import torch
 import torch.nn as nn
 from einops import rearrange
@@ -22,6 +26,7 @@ class TCVA(nn.Module):
         self.out_proj = nn.Conv2d(channels, channels, 1)
 
         self.temperature = nn.Parameter(torch.ones(num_heads, 1, 1) * (self.head_dim ** 0.5))
+        self.beta = nn.Parameter(torch.zeros(1, channels, 1, 1))
 
     def forward(self, f_left: torch.Tensor, f_right: torch.Tensor) -> torch.Tensor:
         B, C, H, W = f_left.shape
@@ -44,4 +49,4 @@ class TCVA(nn.Module):
         out = rearrange(out, "b h d (H W) -> b (h d) H W", H=H, W=W)
         out = self.out_proj(out)
 
-        return f_left + out
+        return f_left + out * self.beta

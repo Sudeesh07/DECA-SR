@@ -36,8 +36,9 @@ def get_phase(iteration, args):
 
 
 def get_patch_size(phase):
-    sizes = {1: 64, 2: 96, 3: 128, 4: 160}
-    return sizes.get(phase, 128)
+    """Returns (patch_h, patch_w) per phase. Width > height for stereo."""
+    sizes = {1: (30, 90), 2: (40, 120), 3: (48, 144), 4: (60, 180)}
+    return sizes.get(phase, (48, 144))
 
 
 def build_optimizer(model, args):
@@ -157,9 +158,9 @@ def train(args):
         if phase != current_phase:
             current_phase = phase
             criterion.set_phase(phase)
-            args.patch_size = get_patch_size(phase)
+            args.patch_h, args.patch_w = get_patch_size(phase)
             logger.info(
-                f"=== Phase {phase} @ iter {iteration}: patch={args.patch_size}, losses={_active_losses(criterion)} ==="
+                f"=== Phase {phase} @ iter {iteration}: patch=({args.patch_h},{args.patch_w}), losses={_active_losses(criterion)} ==="
             )
             train_dataset = build_dataset(args, split="train")
             train_loader = DataLoader(

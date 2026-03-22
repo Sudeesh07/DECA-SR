@@ -34,6 +34,20 @@ def rearrange_back_to_spatial(x: torch.Tensor, H: int, W: int) -> torch.Tensor:
     B, num_heads, head_dim, N = x.shape
     return x.reshape(B, num_heads * head_dim, H, W)
 
+def groupwise_correlation(q, k, num_groups=8):
+    """
+    q, k: [B, C, H, W]
+    returns: [B, num_groups, H, W]
+    """
+    B, C, H, W = q.shape
+    assert C % num_groups == 0
+
+    q = q.view(B, num_groups, C // num_groups, H, W)
+    k = k.view(B, num_groups, C // num_groups, H, W)
+
+    corr = (q * k).mean(dim=2)  # [B, G, H, W]
+    return corr
+
 
 class LayerNorm2d(nn.Module):
     """Channel-wise layer normalization for 2D feature maps."""
@@ -53,23 +67,12 @@ class DECAOffsetPredictor(nn.Module):
     """
     Predicts K sampling offsets along the epipolar line (horizontal for rectified stereo).
 
-    FIX #1: Computes correlation across multiple horizontal shifts instead of only at
-            zero disparity. This gives the network actual stereo matching signal.
-    FIX #6: Concatenates left features into the refinement path so the network has
-            content context for textureless regions.
-
-    Args:
         channels: Number of input channels
         k: Number of sampling points along epipolar line
         max_disparity: Maximum disparity in pixels (clamps offset range)
         num_corr_shifts: Number of horizontal shifts for correlation computation
     """
-    def __init__(
-        self,
-        channels: int,
-        k: int = 8,
-        max_disparity: int = 32,
-        num_corr_shifts: int = 9,
+    def __init__(self, channels: int, k: int = 8, max_disparity: int = 32, num_corr_shifts: int = 9,
     ):
         super().__init__()
         self.k = k
@@ -81,16 +84,11 @@ class DECAOffsetPredictor(nn.Module):
 
         reduced = max(1, channels // 4)
 
-        # Lightweight projections for correlation
         self.query_proj = nn.Conv2d(channels, reduced, 1)
         self.key_proj = nn.Conv2d(channels, reduced, 1)
 
-        # FIX #1: Correlation is now computed at multiple shifts, producing
-        # num_corr_shifts channels. We also concatenate the left features (reduced channels)
-        # for context (FIX #6), so total input to refinement = num_corr_shifts + reduced.
         corr_in_channels = num_corr_shifts + reduced
 
-        # Correlation + context refinement
         self.corr_refine = nn.Sequential(
             nn.Conv2d(corr_in_channels, reduced, 3, padding=1),
             nn.GELU(),
@@ -98,20 +96,15 @@ class DECAOffsetPredictor(nn.Module):
             nn.GELU(),
         )
 
-        # Offset prediction head
         self.offset_head = nn.Conv2d(reduced, k, 1)
 
-        # Initialize to zero offsets, bias spread across disparity range
         nn.init.zeros_(self.offset_head.weight)
         assert self.offset_head.bias is not None
         nn.init.zeros_(self.offset_head.bias)
         with torch.no_grad():
-            self.offset_head.bias.copy_(
-                torch.linspace(-max_disparity // 2, max_disparity // 2, k)
-            )
+            target_normalized = torch.linspace(-0.8, 0.8, k)
+            self.offset_head.bias.copy_(torch.atanh(target_normalized))
 
-        # Precompute the shift values (centered around 0, spaced across a local window)
-        # These are pixel-level shifts for building a mini cost volume
         max_shift = max(1, max_disparity // 4)
         self.register_buffer(
             'shifts',
@@ -132,9 +125,6 @@ class DECAOffsetPredictor(nn.Module):
         q = self.query_proj(f_left)   # [B, reduced, H, W]
         k = self.key_proj(f_right)    # [B, reduced, H, W]
 
-        # FIX #1: Compute correlation at multiple horizontal shifts
-        # This builds a mini cost volume that captures stereo matching signal
-        # across different disparities, not just at zero offset.
         corr_planes = []
         shifts = getattr(self, 'shifts')
         for shift in shifts:
@@ -142,30 +132,24 @@ class DECAOffsetPredictor(nn.Module):
             if shift_val == 0:
                 k_shifted = k
             elif shift_val > 0:
-                # Shift right: pad left side, crop right side
                 k_shifted = F.pad(k, (shift_val, 0, 0, 0), mode='replicate')[:, :, :, :W]
             else:
-                # Shift left: pad right side, crop left side
                 k_shifted = F.pad(k, (0, -shift_val, 0, 0), mode='replicate')[:, :, :, -shift_val:]
-                # Ensure width matches (pad may differ by 1 in edge cases)
                 if k_shifted.shape[-1] < W:
                     k_shifted = F.pad(k_shifted, (0, W - k_shifted.shape[-1]), mode='replicate')
                 k_shifted = k_shifted[:, :, :, :W]
 
-            # Dot product correlation at this shift, summed over channels -> [B, 1, H, W]
             corr_at_shift = (q * k_shifted).sum(dim=1, keepdim=True) * (q.shape[1] ** -0.5)
             corr_planes.append(corr_at_shift)
 
         corr = torch.cat(corr_planes, dim=1)  # [B, num_corr_shifts, H, W]
 
-        # FIX #6: Concatenate left features so the refinement network has content
-        # context, helping in textureless regions where correlation is ambiguous.
         corr = torch.cat([corr, q], dim=1)  # [B, num_corr_shifts + reduced, H, W]
 
-        # Refine and predict offsets
         corr = self.corr_refine(corr)
         offsets = self.offset_head(corr)  # [B, K, H, W]
-        offsets = offsets.clamp(-self.max_disparity, self.max_disparity)
+        # offsets = offsets.clamp(-self.max_disparity, self.max_disparity)
+        offsets = torch.tanh(offsets) * self.max_disparity  # Smoothly clamp to [-max_disparity, max_disparity]
 
         return offsets
 
@@ -178,10 +162,6 @@ class DECA(nn.Module):
     sampling positions. For rectified stereo pairs, epipolar lines are horizontal.
 
     Complexity: O(H*W*K) vs O(H*W*W) for full epipolar attention
-
-    FIX #3: Uses a loop over K for grid_sample instead of expanding memory by K×.
-    FIX #7: Uses a learnable temperature parameter instead of fixed 1/sqrt(d).
-
     Args:
         channels: Number of feature channels
         k: Number of sampling points per query (default: 8)
@@ -235,7 +215,6 @@ class DECA(nn.Module):
                 nn.Sigmoid()
             )
 
-        # FIX #7: Learnable attention temperature
         self.log_scale = nn.Parameter(
             torch.tensor(self.head_dim ** -0.5).log()
         )
@@ -287,46 +266,46 @@ class DECA(nn.Module):
         f_left: torch.Tensor,
         f_right: torch.Tensor,
     ) -> torch.Tensor:
-        """
-        Args:
-            f_left: Left view features [B, C, H, W]
-            f_right: Right view features [B, C, H, W]
-
-        Returns:
-            Enhanced left features [B, C, H, W]
-        """
         B, C, H, W = f_left.shape
 
-        # Normalize inputs
         fl = self.norm_l(f_left)
         fr = self.norm_r(f_right)
 
-        # Predict sampling offsets
         offsets = self.offset_predictor(fl, fr)  # [B, K, H, W]
 
-        # Compute Q/K/V
-        queries = self.q_proj(fl)  # [B, C, H, W]
-        keys = self.k_proj(fr)     # [B, C, H, W]
-        values = self.v_proj(fr)   # [B, C, H, W]
+        queries = self.q_proj(fl)
+        keys = self.k_proj(fr)
+        values = self.v_proj(fr)
 
-        # FIX #3: Sample K/V at offset positions using a loop over K.
-        # This avoids expanding keys/values by K× in memory.
-        # Each iteration samples one offset's worth of keys and values.
+        # Create base grid ONCE, reuse for all K sampling points
+        grid_y = torch.linspace(-1, 1, H, device=f_left.device)
+        grid_x = torch.linspace(-1, 1, W, device=f_left.device)
+        base_y, base_x = torch.meshgrid(grid_y, grid_x, indexing="ij")
+        # Expand to batch: [B, H, W]
+        base_x = base_x.unsqueeze(0).expand(B, -1, -1)
+        base_y = base_y.unsqueeze(0).expand(B, -1, -1)
+
+        # Precompute the pixel-to-grid conversion factor
+        if W > 1:
+            px_to_grid = 2.0 / (W - 1)
+        else:
+            px_to_grid = 0.0
+
         keys_sampled_list = []
         vals_sampled_list = []
         for i in range(self.k):
-            grid_i = self._get_sampling_grid_single(
-                offsets[:, i, :, :], H, W, f_left.device
-            )  # [B, H, W, 2]
+            # Only compute the offset-shifted x coordinate per iteration
+            sample_x = (base_x + offsets[:, i, :, :] * px_to_grid).clamp(-1, 1)
+            grid_i = torch.stack([sample_x, base_y], dim=-1)  # [B, H, W, 2]
 
             ks = F.grid_sample(
                 keys, grid_i,
-                mode='bilinear', padding_mode='zeros', align_corners=True
-            )  # [B, C, H, W]
+                mode='bilinear', padding_mode='border', align_corners=True
+            )
             vs = F.grid_sample(
                 values, grid_i,
-                mode='bilinear', padding_mode='zeros', align_corners=True
-            )  # [B, C, H, W]
+                mode='bilinear', padding_mode='border', align_corners=True
+            )
             keys_sampled_list.append(ks)
             vals_sampled_list.append(vs)
 
@@ -345,7 +324,6 @@ class DECA(nn.Module):
         # Reshape queries: [B, num_heads, head_dim, H*W]
         q = rearrange_to_multihead(queries, self.num_heads, self.head_dim)
 
-        # FIX #7: Use learnable temperature
         scale = self.log_scale.exp()
 
         # Compute attention: Q @ K^T * scale
@@ -373,11 +351,8 @@ class DECA(nn.Module):
 class BidirectionalDECA(nn.Module):
     """
     Bidirectional DECA that enhances both views simultaneously.
-
-    FIX #5: Instead of the flip trick (which assumes horizontal symmetry in
-    learned representations), we use a dedicated R->L path that shares
-    Q/K/V projections but has its own offset predictor with properly
-    negated disparity semantics.
+    Performs DECA from left to right and from right to left in parallel, allowing each to learn offsets independently. This can capture asymmetric occlusion patterns and disparities.
+     Complexity is roughly 2× a single DECA, but provides richer cross-view interactions and can improve performance in occluded regions by allowing the "weaker" view to also attend to the "stronger" view.
     """
     def __init__(
         self,

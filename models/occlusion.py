@@ -1,198 +1,77 @@
-# import torch
-# import torch.nn as nn
-# import torch.nn.functional as F
-
-# from .nafblock import NAFBlock, LayerNorm2d
-
-
-# class ConfidencePredictor(nn.Module):
-#     def __init__(self, channels: int):
-#         super().__init__()
-#         self.lr_branch = nn.Sequential(
-#             nn.Conv2d(channels * 2, channels, 3, padding=1),
-#             nn.GELU(),
-#             nn.Conv2d(channels, channels // 2, 3, padding=1),
-#             nn.GELU(),
-#         )
-#         self.texture_branch = nn.Sequential(
-#             nn.Conv2d(channels, channels // 2, 3, padding=1),
-#             nn.GELU(),
-#             nn.Conv2d(channels // 2, channels // 2, 3, padding=1, groups=channels // 2),
-#             nn.GELU(),
-#         )
-#         self.fuse = nn.Sequential(
-#             nn.Conv2d(channels, channels // 2, 1),
-#             nn.GELU(),
-#             nn.Conv2d(channels // 2, 1, 1),
-#             nn.Sigmoid(),
-#         )
-
-#     def forward(self, f_left: torch.Tensor, f_right: torch.Tensor) -> torch.Tensor:
-#         lr_feat = self.lr_branch(torch.cat([f_left, f_right], dim=1))
-#         tex_feat = self.texture_branch(f_left)
-#         confidence = self.fuse(torch.cat([lr_feat, tex_feat], dim=1))
-#         return confidence
-
-# class SelfAttentionBlock(nn.Module):
-#     def __init__(self, channels: int):
-#         super().__init__()
-#         self.block = NAFBlock(channels)
-
-#     def forward(self, x: torch.Tensor) -> torch.Tensor:
-#         return self.block(x)
-
-# class CrossAttentionBlock(nn.Module):
-#     def __init__(self, channels: int):
-#         super().__init__()
-#         self.norm_l = LayerNorm2d(channels)
-#         self.norm_r = LayerNorm2d(channels)
-#         self.q = nn.Conv2d(channels, channels, 1)
-#         self.k = nn.Conv2d(channels, channels, 1)
-#         self.v = nn.Conv2d(channels, channels, 1)
-#         self.out = nn.Conv2d(channels, channels, 1)
-
-#         self.local_cross = nn.Sequential(
-#             nn.Conv2d(channels * 2, channels, 3, padding=1),
-#             nn.GELU(),
-#             nn.Conv2d(channels, channels, 1),
-#         )
-
-#     def forward(self, f_left: torch.Tensor, f_right: torch.Tensor) -> torch.Tensor:
-#         fl = self.norm_l(f_left)
-#         fr = self.norm_r(f_right)
-#         out = self.local_cross(torch.cat([fl, fr], dim=1))
-#         return out
-
-# class OcclusionAwareFusion(nn.Module):
-#     def __init__(self, channels: int):
-#         super().__init__()
-#         self.confidence = ConfidencePredictor(channels)
-#         self.cross_attn = CrossAttentionBlock(channels)
-#         self.self_attn = SelfAttentionBlock(channels)
-
-#     def forward(self, f_left: torch.Tensor, f_right: torch.Tensor):
-#         C = self.confidence(f_left, f_right)
-#         cross_out = self.cross_attn(f_left, f_right)
-#         self_out = self.self_attn(f_left)
-#         fused = C * cross_out + (1 - C) * self_out + f_left
-
-#         return fused, C
-
-# class StereoConsistencyLoss(nn.Module):
-#     def __init__(self):
-#         super().__init__()
-
-#     def warp_with_disparity(self, img: torch.Tensor, disp: torch.Tensor) -> torch.Tensor:
-#         B, C, H, W = img.shape
-#         grid_y = torch.linspace(-1, 1, H, device=img.device)
-#         grid_x = torch.linspace(-1, 1, W, device=img.device)
-#         grid_y, grid_x = torch.meshgrid(grid_y, grid_x, indexing="ij")
-#         disp_norm = disp.squeeze(1) * 2.0 / W
-#         grid_x_shifted = grid_x.unsqueeze(0) + disp_norm
-#         grid = torch.stack([grid_x_shifted, grid_y.unsqueeze(0).expand(B, -1, -1)], dim=-1)
-
-#         warped = F.grid_sample(img, grid, mode="bilinear",
-#                                 padding_mode="border", align_corners=True)
-#         return warped
-
-#     def forward(self, sr_left, sr_right, disp_lr, disp_rl, confidence):
-#         losses = {}
-
-#         if disp_lr is not None:
-#             warped_r = self.warp_with_disparity(sr_right, disp_lr)
-#             losses["photometric"] = F.l1_loss(sr_left, warped_r)
-#             if disp_rl is not None:
-#                 warped_disp = self.warp_with_disparity(disp_rl, disp_lr)
-#                 losses["cycle"] = F.l1_loss(disp_lr + warped_disp,
-#                                              torch.zeros_like(disp_lr))
-#         eps = 1e-7
-#         entropy = -(confidence * torch.log(confidence + eps) +
-#                     (1 - confidence) * torch.log(1 - confidence + eps))
-#         losses["conf_reg"] = entropy.mean()
-
-#         return losses
-
-
 """
 Occlusion-Aware Fusion Module for Stereo Image Super-Resolution
 
 Handles occluded regions by learning soft confidence maps and using
 self-attention for occluded areas, cross-attention for visible areas.
 
-Key improvements over original:
-1. Multi-scale confidence prediction
-2. Proper cross-attention implementation (not just local convs)
-3. Edge-aware confidence refinement
-4. Bidirectional occlusion handling
-5. Improved stereo consistency loss with occlusion-aware weighting
 """
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Tuple, Optional, Dict
-
+from .nafblock import NAFBlock, LayerNorm2d
 
 # =============================================================================
 # Basic Components
 # =============================================================================
 
-class LayerNorm2d(nn.Module):
-    """Channel-wise layer normalization for 2D feature maps."""
-    def __init__(self, channels: int, eps: float = 1e-6):
-        super().__init__()
-        self.weight = nn.Parameter(torch.ones(channels))
-        self.bias = nn.Parameter(torch.zeros(channels))
-        self.eps = eps
+# class LayerNorm2d(nn.Module):
+#     """Channel-wise layer normalization for 2D feature maps."""
+#     def __init__(self, channels: int, eps: float = 1e-6):
+#         super().__init__()
+#         self.weight = nn.Parameter(torch.ones(channels))
+#         self.bias = nn.Parameter(torch.zeros(channels))
+#         self.eps = eps
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        mean = x.mean(dim=1, keepdim=True)
-        var = x.var(dim=1, keepdim=True, unbiased=False)
-        return self.weight.view(1, -1, 1, 1) * (x - mean) / (var + self.eps).sqrt() + self.bias.view(1, -1, 1, 1)
-
-
-class SimpleGate(nn.Module):
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x1, x2 = x.chunk(2, dim=1)
-        return x1 * x2
+#     def forward(self, x: torch.Tensor) -> torch.Tensor:
+#         mean = x.mean(dim=1, keepdim=True)
+#         var = x.var(dim=1, keepdim=True, unbiased=False)
+#         return self.weight.view(1, -1, 1, 1) * (x - mean) / (var + self.eps).sqrt() + self.bias.view(1, -1, 1, 1)
 
 
-class NAFBlock(nn.Module):
-    """Simplified NAFBlock."""
-    def __init__(self, channels: int, expansion: int = 2):
-        super().__init__()
-        expanded = channels * expansion
+# class SimpleGate(nn.Module):
+#     def forward(self, x: torch.Tensor) -> torch.Tensor:
+#         x1, x2 = x.chunk(2, dim=1)
+#         return x1 * x2
+
+
+# class NAFBlock(nn.Module):
+#     """Simplified NAFBlock."""
+#     def __init__(self, channels: int, expansion: int = 2):
+#         super().__init__()
+#         expanded = channels * expansion
         
-        self.norm1 = LayerNorm2d(channels)
-        self.conv1 = nn.Conv2d(channels, expanded, 1)
-        self.dwconv = nn.Conv2d(expanded, expanded, 3, padding=1, groups=expanded)
-        self.gate1 = SimpleGate()
-        self.proj1 = nn.Conv2d(expanded // 2, channels, 1)
+#         self.norm1 = LayerNorm2d(channels)
+#         self.conv1 = nn.Conv2d(channels, expanded, 1)
+#         self.dwconv = nn.Conv2d(expanded, expanded, 3, padding=1, groups=expanded)
+#         self.gate1 = SimpleGate()
+#         self.proj1 = nn.Conv2d(expanded // 2, channels, 1)
         
-        self.norm2 = LayerNorm2d(channels)
-        self.conv2 = nn.Conv2d(channels, expanded, 1)
-        self.gate2 = SimpleGate()
-        self.proj2 = nn.Conv2d(expanded // 2, channels, 1)
+#         self.norm2 = LayerNorm2d(channels)
+#         self.conv2 = nn.Conv2d(channels, expanded, 1)
+#         self.gate2 = SimpleGate()
+#         self.proj2 = nn.Conv2d(expanded // 2, channels, 1)
         
-        self.beta = nn.Parameter(torch.zeros(1, channels, 1, 1))
-        self.gamma = nn.Parameter(torch.zeros(1, channels, 1, 1))
+#         self.beta = nn.Parameter(torch.zeros(1, channels, 1, 1))
+#         self.gamma = nn.Parameter(torch.zeros(1, channels, 1, 1))
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        shortcut = x
-        x = self.norm1(x)
-        x = self.conv1(x)
-        x = self.dwconv(x)
-        x = self.gate1(x)
-        x = self.proj1(x)
-        x = shortcut + x * self.beta
+#     def forward(self, x: torch.Tensor) -> torch.Tensor:
+#         shortcut = x
+#         x = self.norm1(x)
+#         x = self.conv1(x)
+#         x = self.dwconv(x)
+#         x = self.gate1(x)
+#         x = self.proj1(x)
+#         x = shortcut + x * self.beta
         
-        shortcut = x
-        x = self.norm2(x)
-        x = self.conv2(x)
-        x = self.gate2(x)
-        x = self.proj2(x)
-        x = shortcut + x * self.gamma
-        return x
+#         shortcut = x
+#         x = self.norm2(x)
+#         x = self.conv2(x)
+#         x = self.gate2(x)
+#         x = self.proj2(x)
+#         x = shortcut + x * self.gamma
+#         return x
 
 
 # =============================================================================

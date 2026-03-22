@@ -7,66 +7,66 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math
 from typing import Optional, Tuple
+from .nafblock import LayerNorm2d, SimpleGate, NAFBlock
+
+# class LayerNorm2d(nn.Module):
+#     """Channel-wise layer normalization for 2D feature maps."""
+#     def __init__(self, channels: int, eps: float = 1e-6):
+#         super().__init__()
+#         self.weight = nn.Parameter(torch.ones(channels))
+#         self.bias = nn.Parameter(torch.zeros(channels))
+#         self.eps = eps
+
+#     def forward(self, x: torch.Tensor) -> torch.Tensor:
+#         mean = x.mean(dim=1, keepdim=True)
+#         var = x.var(dim=1, keepdim=True, unbiased=False)
+#         return self.weight.view(1, -1, 1, 1) * (x - mean) / (var + self.eps).sqrt() + self.bias.view(1, -1, 1, 1)
 
 
-class LayerNorm2d(nn.Module):
-    """Channel-wise layer normalization for 2D feature maps."""
-    def __init__(self, channels: int, eps: float = 1e-6):
-        super().__init__()
-        self.weight = nn.Parameter(torch.ones(channels))
-        self.bias = nn.Parameter(torch.zeros(channels))
-        self.eps = eps
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        mean = x.mean(dim=1, keepdim=True)
-        var = x.var(dim=1, keepdim=True, unbiased=False)
-        return self.weight.view(1, -1, 1, 1) * (x - mean) / (var + self.eps).sqrt() + self.bias.view(1, -1, 1, 1)
+# class SimpleGate(nn.Module):
+#     """NAFNet-style SimpleGate: splits channels and multiplies."""
+#     def forward(self, x: torch.Tensor) -> torch.Tensor:
+#         x1, x2 = x.chunk(2, dim=1)
+#         return x1 * x2
 
 
-class SimpleGate(nn.Module):
-    """NAFNet-style SimpleGate: splits channels and multiplies."""
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x1, x2 = x.chunk(2, dim=1)
-        return x1 * x2
-
-
-class NAFBlock(nn.Module):
-    """Simplified NAFBlock for spatial processing."""
-    def __init__(self, channels: int, expansion: int = 2):
-        super().__init__()
-        self.norm1 = LayerNorm2d(channels)
-        self.conv1 = nn.Conv2d(channels, channels * expansion, 1)
-        self.conv2 = nn.Conv2d(channels * expansion, channels * expansion, 3, 
-                               padding=1, groups=channels * expansion)
-        self.sg = SimpleGate()
-        self.conv3 = nn.Conv2d(channels * expansion // 2, channels, 1)
+# class NAFBlock(nn.Module):
+#     """Simplified NAFBlock for spatial processing."""
+#     def __init__(self, channels: int, expansion: int = 2):
+#         super().__init__()
+#         self.norm1 = LayerNorm2d(channels)
+#         self.conv1 = nn.Conv2d(channels, channels * expansion, 1)
+#         self.conv2 = nn.Conv2d(channels * expansion, channels * expansion, 3, 
+#                                padding=1, groups=channels * expansion)
+#         self.sg = SimpleGate()
+#         self.conv3 = nn.Conv2d(channels * expansion // 2, channels, 1)
         
-        self.norm2 = LayerNorm2d(channels)
-        self.conv4 = nn.Conv2d(channels, channels * expansion, 1)
-        self.conv5 = nn.Conv2d(channels * expansion // 2, channels, 1)
+#         self.norm2 = LayerNorm2d(channels)
+#         self.conv4 = nn.Conv2d(channels, channels * expansion, 1)
+#         self.conv5 = nn.Conv2d(channels * expansion // 2, channels, 1)
         
-        self.beta = nn.Parameter(torch.zeros(1, channels, 1, 1))
-        self.gamma = nn.Parameter(torch.zeros(1, channels, 1, 1))
+#         self.beta = nn.Parameter(torch.zeros(1, channels, 1, 1))
+#         self.gamma = nn.Parameter(torch.zeros(1, channels, 1, 1))
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Spatial mixing
-        shortcut = x
-        x = self.norm1(x)
-        x = self.conv1(x)
-        x = self.conv2(x)
-        x = self.sg(x)
-        x = self.conv3(x)
-        x = shortcut + x * self.beta
+#     def forward(self, x: torch.Tensor) -> torch.Tensor:
+#         # Spatial mixing
+#         shortcut = x
+#         x = self.norm1(x)
+#         x = self.conv1(x)
+#         x = self.conv2(x)
+#         x = self.sg(x)
+#         x = self.conv3(x)
+#         x = shortcut + x * self.beta
         
-        # Channel mixing
-        shortcut = x
-        x = self.norm2(x)
-        x = self.conv4(x)
-        x = self.sg(x)
-        x = self.conv5(x)
-        x = shortcut + x * self.gamma
+#         # Channel mixing
+#         shortcut = x
+#         x = self.norm2(x)
+#         x = self.conv4(x)
+#         x = self.sg(x)
+#         x = self.conv5(x)
+#         x = shortcut + x * self.gamma
         
-        return x
+#         return x
 
 
 class FastFourierConvBlock(nn.Module):
@@ -424,27 +424,29 @@ class FrequencyAwareRefinement(nn.Module):
             hf_enhanced = self.hf_branch(f_left)
             streams.append(hf_enhanced)
         
-        # Merge all streams
+        # Merge all streams and add input residual
         merged = self.merge(torch.cat(streams, dim=1))
-        
+        merged = f_left + merged
+
         if self.use_bidirectional:
             # Process right view symmetrically
             spatial_r = self.spatial_stream(f_right)
             spatial_fused_r = self.spatial_fusion(torch.cat([spatial_r, f_left], dim=1))
-            
+
             freq_r = self.freq_stream(f_right)
             freq_fused_r = self.freq_fusion(freq_r, f_left)
-            
+
             streams_r = [spatial_fused_r, freq_fused_r]
-            
+
             if self.use_hf_branch:
                 hf_enhanced_r = self.hf_branch(f_right)
                 streams_r.append(hf_enhanced_r)
-            
+
             merged_r = self.merge(torch.cat(streams_r, dim=1))
-            
+            merged_r = f_right + merged_r
+
             return merged, merged_r
-        
+
         return merged
 
 

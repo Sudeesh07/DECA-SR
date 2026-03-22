@@ -40,19 +40,22 @@ class EncoderStage(nn.Module):
         deca_max_disparity: int = 32,
         num_heads: int = 1,
         downsample: bool = False,
-        drop_path: float = 0.0,
+        drop_path_rates: Optional[List[float]] = None,
     ):
         super().__init__()
+
+        if drop_path_rates is None:
+            drop_path_rates = [0.0] * num_blocks
 
         self.blocks = nn.Sequential(
             *[
                 NAFBlock(
                     in_channels,
                     expansion=2,
-                    drop_path=drop_path,
+                    drop_path=drop_path_rates[i],
                     use_checkpoint=False,
                 )
-                for _ in range(num_blocks)
+                for i in range(num_blocks)
             ]
         )
 
@@ -190,6 +193,7 @@ class StereoSRNetStandalone(nn.Module):
             cross_view_type = "tcva" if i == len(enc_blocks) - 1 else "deca"
             downsample = i < len(enc_blocks) - 1
 
+            stage_dpr = dpr[block_idx:block_idx + num_blocks]
             self.encoder_stages.append(
                 EncoderStage(
                     in_channels=in_ch,
@@ -200,7 +204,7 @@ class StereoSRNetStandalone(nn.Module):
                     deca_max_disparity=deca_max_disparity,
                     num_heads=num_heads,
                     downsample=downsample,
-                    drop_path=dpr[block_idx] if block_idx < len(dpr) else 0.0,
+                    drop_path_rates=stage_dpr,
                 )
             )
             block_idx += num_blocks
