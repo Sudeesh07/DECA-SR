@@ -49,15 +49,13 @@ def get_patch_size(phase: int, scale: int) -> tuple:
     """
     Returns (patch_h, patch_w) in LR space for each phase.
 
-    Source LR patches are 30x90 (x2). Curriculum increases crop size
-    but stays within what the source data supports to avoid excessive padding.
-    For x4, patches are halved in LR space (same HR coverage).
+    Both x2 and x4 datasets have LR patches of 30x90.
+    (x2 HR=60x180, x4 HR=120x360 — same LR size, different HR targets.)
+
+    Curriculum grows the crop toward the full patch size.
     """
-    x2_sizes = {1: (24, 72), 2: (28, 84), 3: (30, 90), 4: (30, 90)}
-    h, w = x2_sizes.get(phase, (30, 90))
-    if scale == 4:
-        h, w = h // 2, w // 2
-    return h, w
+    sizes = {1: (24, 72), 2: (28, 84), 3: (30, 90), 4: (30, 90)}
+    return sizes.get(phase, (30, 90))
 
 
 def build_optimizer(model, args):
