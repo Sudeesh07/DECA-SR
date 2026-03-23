@@ -178,6 +178,9 @@ def train(args):
     train_loader = None
     data_iter = None
 
+    psnr_meter = AverageMeter()
+    ssim_meter = AverageMeter()
+
     model.train()
     for iteration in range(start_iter, args.total_iters):
         phase = get_phase(iteration, args)
@@ -230,6 +233,17 @@ def train(args):
             sr_l, sr_r, conf_l, conf_r = model(lr_l, lr_r)
             loss_g, loss_dict = criterion(sr_l, sr_r, hr_l, hr_r, conf_l, conf_r)
 
+            with torch.no_grad():
+                sr_l_clamped = sr_l.clamp(0, 1)
+                sr_r_clamped = sr_r.clamp(0, 1)
+
+                psnr = 0.5 * (compute_psnr(sr_l_clamped, hr_l) + compute_psnr(sr_r_clamped, hr_r))
+                ssim = 0.5 * (compute_ssim(sr_l_clamped, hr_l) + compute_ssim(sr_r_clamped, hr_r))
+                psnr_meter.update(psnr, lr_l.size(0))
+                ssim_meter.update(ssim, lr_l.size(0))
+                loss_dict["psnr"] = psnr
+                loss_dict["ssim"] = ssim
+
             # GAN generator loss: both views through the CombinedLoss helper
             if criterion.use_adv:
                 adv_g_l = criterion.compute_gan_g_loss(discriminator, sr_l, hr_l)
@@ -264,16 +278,25 @@ def train(args):
         # ── Logging ─────────────────────────────────────────────────
         if iteration % args.log_interval == 0:
             lr = optimizer_g.param_groups[0]["lr"]
-            msg = f"[Phase {current_phase}] Iter {iteration}/{args.total_iters} | lr={lr:.2e} | "
+            msg = (
+                f"[Phase {current_phase}] Iter {iteration}/{args.total_iters} | "
+                f"lr={lr:.2e} | "
+                f"PSNR={psnr_meter.avg:.2f} | SSIM={ssim_meter.avg:.4f} | "
+            )            
             msg += " | ".join(
                 f"{k}={v.item():.4f}" for k, v in loss_dict.items() if isinstance(v, torch.Tensor)
             )
             logger.info(msg)
+            psnr_meter.reset()
+            ssim_meter.reset()
+
             if writer is not None:
+                writer.add_scalar("train/psnr", psnr_meter.avg, iteration)
+                writer.add_scalar("train/ssim", ssim_meter.avg, iteration)
+                writer.add_scalar("train/lr", current_phase, iteration)
                 for k, v in loss_dict.items():
                     if isinstance(v, torch.Tensor):
                         writer.add_scalar(f"train/{k}", v.item(), iteration)
-                writer.add_scalar("train/lr", lr, iteration)
 
         # ── Validation ──────────────────────────────────────────────
         if iteration > 0 and iteration % args.val_interval == 0 and val_loader is not None:
