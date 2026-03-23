@@ -391,7 +391,6 @@ class OcclusionAwareFusion(nn.Module):
         fused = C * cross_out + (1 - C) * self_out
         
         # Add residual and refine
-        fused = fused + f_left
         fused = self.refine(fused)
         
         return fused, C

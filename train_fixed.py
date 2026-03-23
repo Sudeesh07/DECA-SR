@@ -131,7 +131,7 @@ def train(args):
     scheduler_g = build_scheduler(optimizer_g, args)
     scheduler_d = build_scheduler(optimizer_d, args)
 
-    scaler = GradScaler(enabled=args.fp16)
+    scaler = torch.amp.GradScaler("cuda", enabled=args.fp16)
     start_iter = 0
     best_psnr = 0.0
 
