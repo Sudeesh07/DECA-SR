@@ -8,8 +8,8 @@ def get_config():
     # ── Model ───────────────────────────────────────────────────────────
     parser.add_argument("--scale", type=int, default=4, choices=[2, 4])
     parser.add_argument("--in_channels", type=int, default=3)
-    parser.add_argument("--embed_dim", type=int, default=48)
-    parser.add_argument("--enc_blocks", nargs="+", type=int, default=[4, 6, 6])
+    parser.add_argument("--embed_dim", type=int, default=96)
+    parser.add_argument("--enc_blocks", nargs="+", type=int, default=[6, 8, 8])
     parser.add_argument("--dec_blocks", nargs="+", type=int, default=[4, 4])
     parser.add_argument("--depa_k", type=int, default=8)
     parser.add_argument("--depa_max_disparity", type=int, default=32)
