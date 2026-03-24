@@ -24,7 +24,7 @@ from typing import List, Optional, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
+from .scam import LightweightSCAM, InterleavedEncoderStage
 from models.nafblock import NAFBlock, LayerNorm2d
 
 from .depa import DEPA, BidirectionalDEPA
@@ -300,8 +300,17 @@ class StereoSRNetV2(nn.Module):
             # Scale max_disparity with resolution: i downsamples happened before this stage
             stage_disp = depa_max_disparity // (2 ** i)
             self.encoder_stages.append(
-                EncoderStage(
-                    embed_dim, nb, depa_k, stage_disp, num_heads, downsample, rates,
+                # EncoderStage(
+                #     embed_dim, nb, depa_k, stage_disp, num_heads, downsample, rates,
+                # )
+                InterleavedEncoderStage(
+                    embed_dim, nb,
+                    scam_interval=2,
+                    depa_k=depa_k,
+                    depa_max_disparity=stage_disp,
+                    num_heads=num_heads,
+                    downsample=downsample,
+                    drop_path_rates=rates,
                 )
             )
             block_idx += nb

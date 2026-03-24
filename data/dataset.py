@@ -226,7 +226,7 @@ class StereoSRDataset(Dataset):
         if pad_h > 0 or pad_w > 0:
             # Reflect requires pad < dim; fall back to replicate for large pads
             can_reflect = pad_h < h and pad_w < w and h > 1 and w > 1
-            mode = "reflect" if can_reflect else "replicate"
+            mode = "reflection" if can_reflect else "replicate"
             img = TF.pad(img, [0, 0, pad_w, pad_h], padding_mode=mode)
         return img
 

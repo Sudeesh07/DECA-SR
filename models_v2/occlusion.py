@@ -10,7 +10,11 @@ prediction and cross-view attention:
 4. Cross-attention queries are modulated by correlation (warm-start matching)
 5. Self-attention fallback for occluded regions (never zeros out)
 
-Output = C * cross_out + (1-C) * self_out
+Output = f_left + beta * (C * cross_out + (1-C) * self_out)
+
+Key fix: Both paths produce RAW outputs (no internal residual from f_left).
+This ensures C * cross_out != (1-C) * self_out at init, giving the
+confidence map gradient signal from the very first iteration.
 """
 
 import torch
@@ -40,7 +44,7 @@ class GroupwiseCorrelation(nn.Module):
         self.groups = groups
         self.max_disp = max_disp
         self.group_channels = channels // groups
-        self.num_disps = 2 * max_disp - 1  # [-max_disp+1, ..., 0, ..., max_disp-1]
+        self.num_disps = 2 * max_disp - 1
 
     def forward(
         self, f_left: torch.Tensor, f_right: torch.Tensor
@@ -104,8 +108,10 @@ class GuidedEpipolarAttention(nn.Module):
 
     The correlation features encode disparity information — adding them
     to the query shifts each query's representation towards matching the
-    correct key position, producing higher attention scores at the right
-    disparities. This gives attention a warm start from stereo matching.
+    correct key position. This gives attention a warm start from stereo matching.
+
+    Returns RAW attention output (no internal f_left residual).
+    The external residual is handled by HybridOcclusionFusion.
     """
 
     def __init__(self, channels: int):
@@ -121,11 +127,10 @@ class GuidedEpipolarAttention(nn.Module):
 
         # Correlation modulates queries (tells them WHERE to look)
         self.corr_to_q = nn.Conv2d(channels, channels, 1)
+        # Start partially active so correlation influences queries from the start
+        self.alpha = nn.Parameter(torch.tensor(0.1))
 
         self.out_proj = nn.Conv2d(channels, channels, 1)
-        self.beta = nn.Parameter(torch.zeros(1, channels, 1, 1))
-        self.alpha = nn.Parameter(torch.zeros(1))  # starts at 0 → safe init
-
 
     def forward(
         self,
@@ -133,13 +138,14 @@ class GuidedEpipolarAttention(nn.Module):
         f_right: torch.Tensor,
         corr_feat: torch.Tensor,
     ) -> torch.Tensor:
+        """Returns raw cross-attention output [B, C, H, W]. No residual."""
         B, C, H, W = f_left.shape
 
         fl = self.norm_l(f_left)
         fr = self.norm_r(f_right)
 
         # Query incorporates correlation prior
-        q = self.q_proj(fl) + self.alpha * self.corr_to_q(corr_feat)        
+        q = self.q_proj(fl) + self.alpha * self.corr_to_q(corr_feat)
         k = self.k_proj(fr)
         v = self.v_proj(fr)
 
@@ -153,9 +159,68 @@ class GuidedEpipolarAttention(nn.Module):
         out = torch.bmm(attn, v)  # [B*H, W, C]
 
         out = out.reshape(B, H, W, C).permute(0, 3, 1, 2)  # [B, C, H, W]
-        out = self.out_proj(out)
+        return self.out_proj(out)
 
-        return f_left + out * self.beta
+
+# ── Self-View Refinement Path ───────────────────────────────────────────
+
+
+class SelfViewPath(nn.Module):
+    """
+    Intra-view refinement for occluded regions.
+
+    Uses plain convolutions (NOT NAFBlocks with zero-init residual scaling)
+    to ensure the output is different from the input at initialization.
+    This is critical: if self_out == f_left at init, then C has no gradient
+    because C * cross_out + (1-C) * f_left = f_left when cross_out = f_left too.
+
+    With plain convolutions and random init, self_out != cross_out at init,
+    giving C gradient signal to learn which regions should use which path.
+    """
+
+    def __init__(self, channels: int):
+        super().__init__()
+        self.net = nn.Sequential(
+            LayerNorm2d(channels),
+            nn.Conv2d(channels, channels, 3, padding=1),
+            nn.GELU(),
+            nn.Conv2d(channels, channels, 3, padding=1),
+            nn.GELU(),
+            nn.Conv2d(channels, channels, 1),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Returns raw self-refined features [B, C, H, W]. No residual."""
+        return self.net(x)
+
+
+# ── Cross-View Refinement Path ──────────────────────────────────────────
+
+
+class CrossViewPath(nn.Module):
+    """
+    Cross-view attention + refinement.
+
+    Guided epipolar attention pulls info from the other view,
+    then a small conv refines it. Returns raw output (no residual).
+    """
+
+    def __init__(self, channels: int):
+        super().__init__()
+        self.attn = GuidedEpipolarAttention(channels)
+        self.refine = nn.Sequential(
+            LayerNorm2d(channels),
+            nn.Conv2d(channels, channels, 3, padding=1),
+            nn.GELU(),
+            nn.Conv2d(channels, channels, 1),
+        )
+
+    def forward(
+        self, f_left: torch.Tensor, f_right: torch.Tensor, corr_feat: torch.Tensor
+    ) -> torch.Tensor:
+        """Returns raw cross-view features [B, C, H, W]. No residual."""
+        x = self.attn(f_left, f_right, corr_feat)
+        return self.refine(x)
 
 
 # ── Confidence Predictor ────────────────────────────────────────────────
@@ -164,14 +229,17 @@ class GuidedEpipolarAttention(nn.Module):
 class HybridConfidencePredictor(nn.Module):
     """
     Predicts occlusion confidence from four cues:
-    - f_left, f_right: both view features (symmetric)
+    - f_left, f_right: both view features
     - gradient: |f_left - f_right| (occlusion boundary signal)
     - corr_feat: encoded correlation volume (disparity-aware matching quality)
 
     A position with low correlation at ALL disparities is likely occluded.
-    This is strictly more informative than zero-disparity correlation alone.
 
     Output: C in [0, 1] where 1 = visible, 0 = occluded.
+
+    Initialization: final conv bias = 0 so sigmoid(0) = 0.5.
+    This means confidence starts at 0.5 everywhere, giving equal weight
+    to both paths and allowing gradients to flow through C from step 1.
     """
 
     def __init__(self, channels: int):
@@ -189,11 +257,13 @@ class HybridConfidencePredictor(nn.Module):
             nn.Conv2d(reduced, reduced, 3, padding=1),
             nn.GELU(),
             nn.Conv2d(reduced, 1, 3, padding=1),
-            # nn.Sigmoid(),
         )
+
         self.temperature = nn.Parameter(torch.ones(1))
 
-
+        # Initialize final conv to output ~0 pre-sigmoid → sigmoid(0) = 0.5
+        nn.init.zeros_(self.head[-1].weight)
+        nn.init.zeros_(self.head[-1].bias)
 
     def forward(
         self,
@@ -207,6 +277,7 @@ class HybridConfidencePredictor(nn.Module):
         logits = self.head(x)
         return torch.sigmoid(logits / (self.temperature + 1e-6))
 
+
 # ── Hybrid Occlusion Fusion ────────────────────────────────────────────
 
 
@@ -218,13 +289,17 @@ class HybridOcclusionFusion(nn.Module):
         1. Build correlation volume across D disparities
         2. Encode into spatial features via 3D conv
         3. Predict confidence using L, R, gradient, and correlation
-        4. Cross path: correlation-guided epipolar attention + NAFBlock
-        5. Self path: NAFBlock x 2 (intra-view fallback)
-        6. Blend: C * cross_out + (1-C) * self_out
+        4. Cross path: correlation-guided epipolar attention (raw output)
+        5. Self path: conv refinement (raw output)
+        6. Blend: f_left + beta * (C * cross_out + (1-C) * self_out)
 
-    Both paths have internal residuals from f_left, so:
-    - At init (beta/gamma=0): output = f_left (identity)
-    - Occluded pixels (C≈0): fall back to self-attention, never to zero
+    Critical design for gradient flow:
+        - Both paths produce RAW outputs (not f_left + something)
+        - At init, cross_out != self_out (different random weights)
+        - So C has gradient: d/dC [C*a + (1-C)*b] = a - b != 0
+        - beta starts small (0.01) so the module doesn't perturb f_left much
+          at init, but is nonzero so gradients flow through all components
+        - Confidence starts at 0.5 (sigmoid of zero-init bias)
     """
 
     def __init__(
@@ -239,18 +314,18 @@ class HybridOcclusionFusion(nn.Module):
         self.corr = GroupwiseCorrelation(channels, corr_groups, corr_max_disp)
         self.corr_encoder = CorrelationEncoder(corr_groups, channels)
 
-        # Confidence prediction
+        # Confidence prediction (initialized to output 0.5)
         self.confidence = HybridConfidencePredictor(channels)
 
-        # Cross path: guided attention + refinement
-        self.cross_attn = GuidedEpipolarAttention(channels)
-        self.cross_refine = NAFBlock(channels)
+        # Cross path: guided attention + refinement (raw output, no residual)
+        self.cross_path = CrossViewPath(channels)
 
-        # Self path: intra-view only
-        self.self_path = nn.Sequential(
-            NAFBlock(channels),
-            NAFBlock(channels),
-        )
+        # Self path: intra-view refinement (raw output, no residual)
+        self.self_path = SelfViewPath(channels)
+
+        # External residual scaling
+        # Starts small but nonzero so gradients flow through everything
+        self.beta = nn.Parameter(torch.tensor(0.01))
 
     def forward(
         self, f_left: torch.Tensor, f_right: torch.Tensor
@@ -258,23 +333,27 @@ class HybridOcclusionFusion(nn.Module):
         """
         Returns:
             fused:      [B, C, H, W] occlusion-aware fused features
-            confidence: [B, 1, H, W] confidence map
+            confidence: [B, 1, H, W] confidence map (1=visible, 0=occluded)
         """
         # Disparity-aware correlation
         corr_vol = self.corr(f_left, f_right)       # [B, G, D, H, W]
         corr_feat = self.corr_encoder(corr_vol)      # [B, C, H, W]
 
-        # Confidence
-        C = self.confidence(f_left, f_right, corr_feat)
+        # Confidence (starts at 0.5 everywhere)
+        C = self.confidence(f_left, f_right, corr_feat)  # [B, 1, H, W]
 
-        # Cross path (correlation-guided)
-        cross_out = self.cross_attn(f_left, f_right, corr_feat)
-        cross_out = self.cross_refine(cross_out)
+        # Cross path: raw cross-view output (NOT f_left + ...)
+        cross_out = self.cross_path(f_left, f_right, corr_feat)  # [B, C, H, W]
 
-        # Self path
-        self_out = self.self_path(f_left)
+        # Self path: raw self-view output (NOT f_left + ...)
+        self_out = self.self_path(f_left)  # [B, C, H, W]
 
-        # Blend: both paths contain f_left via internal residuals
-        fused = C * cross_out + (1 - C) * self_out
+        # Blend with external residual
+        # At init: beta=0.01, C=0.5, cross_out and self_out are random
+        # Output ≈ f_left + 0.01 * (0.5 * random_a + 0.5 * random_b) ≈ f_left
+        # But crucially, d(output)/dC = beta * (cross_out - self_out) != 0
+        # So C receives gradient and can learn from step 1
+        blended = C * cross_out + (1 - C) * self_out
+        fused = f_left + self.beta * blended
 
         return fused, C

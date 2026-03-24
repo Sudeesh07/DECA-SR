@@ -54,7 +54,7 @@ def get_patch_size(phase: int, scale: int) -> tuple:
 
     Curriculum grows the crop toward the full patch size.
     """
-    sizes = {1: (24, 72), 2: (28, 84), 3: (30, 90), 4: (30, 90)}
+    sizes = {1: (30, 90), 2: (40, 120), 3: (48, 144), 4: (60, 180)}
     return sizes.get(phase, (30, 90))
 
 
@@ -285,17 +285,18 @@ def train(args):
                 f"{k}={v.item():.4f}" for k, v in loss_dict.items() if isinstance(v, torch.Tensor)
             )
             logger.info(msg)
-            psnr_meter.reset()
-            ssim_meter.reset()
+
 
             if writer is not None:
                 writer.add_scalar("train/psnr", psnr_meter.avg, iteration)
                 writer.add_scalar("train/ssim", ssim_meter.avg, iteration)
-                writer.add_scalar("train/lr", current_phase, iteration)
+                writer.add_scalar("train/lr", lr, iteration)
                 for k, v in loss_dict.items():
                     if isinstance(v, torch.Tensor):
                         writer.add_scalar(f"train/{k}", v.item(), iteration)
-
+            
+            psnr_meter.reset()
+            ssim_meter.reset()
         # ── Validation ──────────────────────────────────────────────
         if iteration > 0 and iteration % args.val_interval == 0 and val_loader is not None:
             psnr, ssim = validate(model, val_loader, device, logger)
