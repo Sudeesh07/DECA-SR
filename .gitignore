@@ -83,7 +83,7 @@ Thumbs.db
 .pytest_cache/
 
 # Coverage reports
-
+*.tex
 htmlcov/
 .coverage
 .coverage.*

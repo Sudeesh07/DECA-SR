@@ -122,23 +122,44 @@ class GuidedEpipolarAttention(nn.Module):
         grid_y = grid_y.view(1, 1, h, w).expand(b, self.num_points, -1, -1)
 
         sign = 1.0 if reverse else -1.0
+        # px_to_grid = 2.0 / max(w - 1, 1)
+        # sample_x = grid_x + sign * disparity_samples * px_to_grid
+        # valid = (sample_x >= -1.0) & (sample_x <= 1.0)
+        # grid = torch.stack([sample_x, grid_y], dim=-1)
+
+        # feat_rep = feat.unsqueeze(1).expand(-1, self.num_points, -1, -1, -1).reshape(b * self.num_points, c, h, w)
+        # grid = grid.reshape(b * self.num_points, h, w, 2)
+        # sampled = F.grid_sample(
+        #     feat_rep,
+        #     grid,
+        #     mode="bilinear",
+        #     padding_mode="zeros",
+        #     align_corners=True,
+        # )
+        # sampled = sampled.view(b, self.num_points, c, h, w).permute(0, 2, 3, 4, 1).contiguous()
+        # valid = valid.view(b, 1, h, w, self.num_points)
+        # return sampled, valid
+
+
         px_to_grid = 2.0 / max(w - 1, 1)
-        sample_x = grid_x + sign * disparity_samples * px_to_grid
-        valid = (sample_x >= -1.0) & (sample_x <= 1.0)
+        # Clamp the x-coordinates to the valid grid bounds [-1.0, 1.0]
+        sample_x = (grid_x + sign * disparity_samples * px_to_grid).clamp(-1.0, 1.0)
         grid = torch.stack([sample_x, grid_y], dim=-1)
 
         feat_rep = feat.unsqueeze(1).expand(-1, self.num_points, -1, -1, -1).reshape(b * self.num_points, c, h, w)
         grid = grid.reshape(b * self.num_points, h, w, 2)
+        
+        # Use padding_mode="border" so edge pixels are replicated naturally
         sampled = F.grid_sample(
             feat_rep,
             grid,
             mode="bilinear",
-            padding_mode="zeros",
+            padding_mode="border", 
             align_corners=True,
         )
         sampled = sampled.view(b, self.num_points, c, h, w).permute(0, 2, 3, 4, 1).contiguous()
-        valid = valid.view(b, 1, h, w, self.num_points)
-        return sampled, valid
+        
+        return sampled, torch.ones_like(sample_x, dtype=torch.bool)
 
     def forward(
         self,
