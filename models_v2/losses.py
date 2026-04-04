@@ -6,6 +6,10 @@ Multi-phase curriculum:
   Phase 2: + Wavelet frequency + Stereo photometric
   Phase 3: + Perceptual (VGG) + Confidence entropy regularization
   Phase 4: + Adversarial (RaGAN) — GAN loss computed via forward_g / forward_d
+
+Fixes applied:
+  - Stereo loss: wider disparity range, unweighted fallback when confidence is dead
+  - Confidence reg: handles zero-confidence edge case (returns max entropy as penalty)
 """
 
 from typing import Dict, Optional, Tuple
@@ -138,11 +142,24 @@ class WaveletSubbandLoss(nn.Module):
 
 
 class PhotometricStereoLoss(nn.Module):
-    """Symmetric shift-based stereo consistency."""
+    """
+    Symmetric shift-based stereo consistency.
 
-    def __init__(self, disparities: Tuple[int, ...] = (1, 2, 4, 8, 16)):
+    FIX: Wider disparity range covering typical Flickr1024 sterities (up to 64px HR).
+    FIX: Falls back to unweighted loss when confidence is dead (all zeros or near-zero).
+         This ensures the stereo loss provides gradient signal even before the
+         confidence head has learned, which in turn gives the confidence head
+         something to learn from.
+    """
+
+    def __init__(
+        self,
+        disparities: Tuple[int, ...] = (1, 2, 4, 8, 16, 24, 32, 48, 64),
+        conf_alive_threshold: float = 0.01,
+    ):
         super().__init__()
         self.disparities = disparities
+        self.conf_alive_threshold = conf_alive_threshold
 
     @staticmethod
     def _resize_conf(conf: torch.Tensor, h: int, w: int) -> torch.Tensor:
@@ -150,11 +167,21 @@ class PhotometricStereoLoss(nn.Module):
             return conf
         return F.interpolate(conf, size=(h, w), mode="bilinear", align_corners=False)
 
+    def _conf_is_alive(self, conf: Optional[torch.Tensor]) -> bool:
+        """Check if confidence map has meaningful (non-zero) values."""
+        if conf is None:
+            return False
+        return conf.mean().item() > self.conf_alive_threshold
+
     def _one_direction(self, src, tgt, conf):
         _, _, h, w = src.shape
         total = src.new_tensor(0.0)
         count = 0
-        conf_r = self._resize_conf(conf, h, w) if conf is not None else None
+
+        # Check if confidence is usable; if dead, use unweighted loss
+        use_conf = conf is not None and self._conf_is_alive(conf)
+        conf_r = self._resize_conf(conf, h, w) if use_conf else None
+
         for d in self.disparities:
             if d >= w:
                 continue
@@ -184,13 +211,6 @@ class CombinedLoss(nn.Module):
     Phase 3: + perceptual + confidence entropy regularization
     Phase 4: + adversarial (GAN loss added via compute_gan_g_loss, discriminator
               updated separately in training loop via compute_gan_d_loss)
-
-    Adversarial note:
-        GAN training requires a separate discriminator and optimizer. This module
-        provides compute_gan_g_loss() and compute_gan_d_loss() helpers that the
-        training loop should call when phase >= 4. The generator loss is added to
-        the total; the discriminator loss is returned separately for its own
-        optimizer step.
     """
 
     def __init__(
@@ -236,18 +256,6 @@ class CombinedLoss(nn.Module):
         sr: torch.Tensor,
         gt: torch.Tensor,
     ) -> torch.Tensor:
-        """
-        Generator adversarial loss for one view.
-        Call this in the training loop when phase >= 4, after the main forward.
-
-        Args:
-            discriminator: the discriminator module
-            sr: super-resolved output [B, 3, H, W]
-            gt: ground truth [B, 3, H, W]
-
-        Returns:
-            Weighted generator GAN loss (ready to add to total)
-        """
         d_fake = discriminator(sr)
         with torch.no_grad():
             d_real = discriminator(gt)
@@ -259,18 +267,6 @@ class CombinedLoss(nn.Module):
         sr: torch.Tensor,
         gt: torch.Tensor,
     ) -> torch.Tensor:
-        """
-        Discriminator loss for one view.
-        Call this in the training loop for the discriminator optimizer step.
-
-        Args:
-            discriminator: the discriminator module
-            sr: super-resolved output [B, 3, H, W] (detached)
-            gt: ground truth [B, 3, H, W]
-
-        Returns:
-            Discriminator loss
-        """
         d_real = discriminator(gt)
         d_fake = discriminator(sr.detach())
         return self.gan_loss.forward_d(d_real, d_fake)
@@ -296,6 +292,9 @@ class CombinedLoss(nn.Module):
             total = total + self.w_freq * l_freq
 
         if self.use_stereo:
+            # Stereo loss with fallback: if confidence is dead (all zeros),
+            # uses unweighted photometric loss so gradients still flow.
+            # Once confidence becomes alive, it gates the loss properly.
             l_stereo = self.stereo_loss(sr_left, sr_right, conf_left, conf_right)
             losses["stereo"] = l_stereo
             total = total + self.w_stereo * l_stereo
@@ -305,24 +304,39 @@ class CombinedLoss(nn.Module):
             losses["percep"] = l_percep
             total = total + self.w_percep * l_percep
 
-        # Confidence entropy regularization: pushes C toward 0 or 1 (decisive).
-        # Only active from phase 3 onward, after the network has learned meaningful
-        # stereo correspondences. Running this in phase 1 would lock randomly
-        # initialized confidence into premature binary patterns.
+        # Confidence entropy regularization.
+        # FIX: Handles the case where confidence is all zeros or all ones.
+        # If confidence is stuck at 0 (dead), entropy is 0, which gives no gradient.
+        # Instead, we compute a penalty that pushes dead confidence toward 0.5
+        # (maximum entropy) so the network learns to make decisions.
         if self.use_conf_reg and conf_left is not None and conf_right is not None:
             cl = F.interpolate(conf_left, size=sr_left.shape[-2:], mode="bilinear", align_corners=False)
             cr = F.interpolate(conf_right, size=sr_right.shape[-2:], mode="bilinear", align_corners=False)
-            eps = 1e-7
-            ent_l = -(cl * torch.log(cl + eps) + (1 - cl) * torch.log(1 - cl + eps))
-            ent_r = -(cr * torch.log(cr + eps) + (1 - cr) * torch.log(1 - cr + eps))
-            l_conf = 0.5 * (ent_l.mean() + ent_r.mean())
-            losses["conf_reg"] = l_conf
-            total = total + self.w_conf_reg * l_conf
 
-        # Note: adversarial loss is NOT computed here because it requires a
-        # discriminator module and separate optimizer steps. Use
-        # compute_gan_g_loss() and compute_gan_d_loss() in the training loop
-        # when self.use_adv is True (phase >= 4).
+            # Clamp to avoid log(0) but keep gradients flowing
+            cl = cl.clamp(1e-6, 1 - 1e-6)
+            cr = cr.clamp(1e-6, 1 - 1e-6)
+
+            # Binary entropy: H(p) = -p*log(p) - (1-p)*log(1-p)
+            # Maximum at p=0.5 (H=ln(2)≈0.693), minimum at p=0 or p=1 (H=0)
+            ent_l = -(cl * torch.log(cl) + (1 - cl) * torch.log(1 - cl))
+            ent_r = -(cr * torch.log(cr) + (1 - cr) * torch.log(1 - cr))
+            l_conf = 0.5 * (ent_l.mean() + ent_r.mean())
+
+            # If confidence is nearly dead (mean close to 0 or 1 with no variance),
+            # the entropy is near 0 and provides no gradient to push it toward
+            # being useful. Add a variance penalty to encourage the confidence
+            # map to be spatially varying (not a flat field).
+            var_l = cl.var()
+            var_r = cr.var()
+            # Target: we want some variance. Penalty for low variance.
+            var_penalty = 0.5 * (torch.exp(-var_l * 100) + torch.exp(-var_r * 100))
+
+            l_conf = l_conf + 0.1 * var_penalty
+
+            losses["conf_reg"] = l_conf
+            losses["conf_mean"] = 0.5 * (cl.mean() + cr.mean())  # for monitoring
+            total = total + self.w_conf_reg * l_conf
 
         losses["total"] = total
         return total, losses

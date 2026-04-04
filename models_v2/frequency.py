@@ -51,7 +51,7 @@ class LightweightFrequencyRefinement(nn.Module):
             LayerNorm2d(channels * 2),
             nn.Conv2d(channels * 2, channels, 1),
         )
-        self.beta = nn.Parameter(torch.zeros(1))
+        self.beta = nn.Parameter(torch.tensor(0.05))  # Learnable residual scaling
 
     @staticmethod
     def _build_laplacian(channels: int) -> torch.Tensor:

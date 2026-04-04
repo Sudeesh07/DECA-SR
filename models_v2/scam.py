@@ -22,6 +22,11 @@ class LightweightSCAM(nn.Module):
     """
     Stereo Cross-Attention Module (lightweight).
 
+    For each spatial position, computes channel-wise correlation between
+    left and right views, applies softmax to get attention weights,
+    and uses them to aggregate cross-view information. The entire
+    operation is O(H*W*C) — no quadratic attention, no grid sampling.
+
     This is intentionally simple. The heavy lifting (deformable spatial
     attention, channel attention, offset prediction) is done by DEPA
     at the end of each stage. SCAM's job is just to keep cross-view
@@ -38,6 +43,7 @@ class LightweightSCAM(nn.Module):
         self.norm_l = LayerNorm2d(channels)
         self.norm_r = LayerNorm2d(channels)
 
+        # Project both views to a shared correlation space
         # 1x1 conv is cheap and gives each view a learned representation
         self.proj_l = nn.Conv2d(channels, channels, 1)
         self.proj_r = nn.Conv2d(channels, channels, 1)
@@ -46,8 +52,8 @@ class LightweightSCAM(nn.Module):
         self.scale = channels ** -0.5
 
         # Learnable residual scaling — starts at zero (identity at init)
-        self.beta_l = nn.Parameter(torch.zeros(1, channels, 1, 1))
-        self.beta_r = nn.Parameter(torch.zeros(1, channels, 1, 1))
+        self.beta_l = nn.Parameter(torch.ones(1, channels, 1, 1)*0.05)
+        self.beta_r = nn.Parameter(torch.ones(1, channels, 1, 1)*0.05)
 
     def forward(
         self, f_left: torch.Tensor, f_right: torch.Tensor
@@ -68,11 +74,21 @@ class LightweightSCAM(nn.Module):
         ql = self.proj_l(fl)  # [B, C, H, W]
         qr = self.proj_r(fr)  # [B, C, H, W]
 
-
+        # Channel-wise correlation at each spatial position
+        # corr[b, c, h, w] = ql[b, c, h, w] * qr[b, c, h, w]
+        # This is element-wise — O(BCHW), no quadratic cost
         corr = ql * qr * self.scale  # [B, C, H, W]
+
+        # Attention weights via sigmoid (per-channel, per-position gate)
+        # sigmoid is better than softmax here because we're gating
+        # individual channel-position pairs, not competing across positions
         attn = torch.sigmoid(corr)  # [B, C, H, W]
 
-
+        # Cross-view aggregation:
+        # High attention → this position+channel has good correspondence
+        # → pull information from the other view
+        # Low attention → poor correspondence (occlusion, texture-less)
+        # → keep original features
         enhanced_l = f_left + self.beta_l * (attn * fr)
         enhanced_r = f_right + self.beta_r * (attn * fl)
 

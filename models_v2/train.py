@@ -23,7 +23,7 @@ from utils_fixed import (
 
 from .config import get_config
 from .losses import CombinedLoss, Discriminator
-from .network import build_model_v2
+from .network_stable import build_model_stable
 
 
 def set_seed(seed: int):
@@ -122,7 +122,7 @@ def train(args):
     logger.info(f"Config: {args}")
     set_seed(args.seed)
 
-    model = build_model_v2(args).to(device)
+    model = build_model_stable(args).to(device)
     params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     logger.info(f"Model parameters: {params / 1e6:.2f}M")
 

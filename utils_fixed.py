@@ -143,7 +143,12 @@ class TLSC:
 def tensor_to_image(tensor: torch.Tensor) -> np.ndarray:
     if tensor.dim() == 4:
         tensor = tensor.squeeze(0)
-    img = tensor.clamp(0, 1).permute(1, 2, 0).detach().cpu().numpy()
+    tensor = tensor.clamp(0, 1)
+    # Handle single-channel tensors (e.g., confidence maps)
+    if tensor.shape[0] == 1:
+        img = tensor.squeeze(0).detach().cpu().numpy()
+    else:
+        img = tensor.permute(1, 2, 0).detach().cpu().numpy()
     return (img * 255).astype(np.uint8)
 
 

@@ -129,7 +129,7 @@ class CorrelationPrior(nn.Module):
             nn.GELU(),
             nn.Conv2d(channels, channels, 1),
         )
-        self.beta = nn.Parameter(torch.zeros(1, channels, 1, 1))
+        self.beta = nn.Parameter(torch.ones(1, channels, 1, 1)*0.05)
 
     def forward(self, f_left: torch.Tensor, f_right: torch.Tensor) -> torch.Tensor:
         B, C, H, W = f_left.shape
@@ -213,30 +213,43 @@ class Upsampler(nn.Module):
 
     def __init__(self, channels: int, scale: int, out_channels: int = 3):
         super().__init__()
-        if scale == 4:
-            self.up = nn.Sequential(
-                nn.Conv2d(channels, channels * 4, 3, padding=1),
-                nn.PixelShuffle(2),
-                LayerNorm2d(channels),
-                nn.GELU(),
-                nn.Conv2d(channels, channels * 4, 3, padding=1),
-                nn.PixelShuffle(2),
-            )
-        elif scale == 2:
-            self.up = nn.Sequential(
-                nn.Conv2d(channels, channels * 4, 3, padding=1),
-                nn.PixelShuffle(2),
-            )
-        else:
-            raise ValueError(f"Unsupported scale: {scale}")
+        # if scale == 4:
+        #     self.pre = nn.Sequential(
+        #         NAFBlock(channels),
+        #         NAFBlock(channels),
+        #     )
+        #     self.up = nn.Sequential(
+        #         nn.Conv2d(channels, channels * 4, 3, padding=1),
+        #         nn.PixelShuffle(2),
+        #         LayerNorm2d(channels),
+        #         nn.GELU(),
 
-        self.final = nn.Sequential(
-            LayerNorm2d(channels),
-            nn.Conv2d(channels, out_channels, 3, padding=1),
+        #         nn.Conv2d(channels, channels * 4, 3, padding=1),
+        #         nn.PixelShuffle(2),
+        #     )
+        # elif scale == 2:
+        #     self.up = nn.Sequential(
+        #         nn.Conv2d(channels, channels * 4, 3, padding=1),
+        #         nn.PixelShuffle(2),
+        #     )
+        # else:
+        #     raise ValueError(f"Unsupported scale: {scale}")
+
+        self.scale = scale
+        self.up = nn.Sequential(
+            nn.Conv2d(channels, out_channels * (scale ** 2), 3, padding=1),
+            nn.PixelShuffle(scale),
         )
 
+
+        # self.final = nn.Sequential(
+        #     LayerNorm2d(channels),
+        #     nn.Conv2d(channels, out_channels, 3, padding=1),
+        # )
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.final(self.up(x))
+        return self.up(x)
+        # return self.final(self.up(x))
 
 
 # ── Main Network ────────────────────────────────────────────────────────

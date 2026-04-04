@@ -32,7 +32,7 @@ venv/
 env/
 ENV/
 .venv/
-
+/experiments
 # PyTorch / training artifacts
 
 checkpoints/
@@ -42,9 +42,9 @@ weights/
 *.ckpt
 
 # Logs
-
+*tb_logs/
 logs/
-*.log
+# *.log
 wandb/
 tensorboard/
 runs/
@@ -88,11 +88,15 @@ htmlcov/
 .coverage
 .coverage.*
 
-experiments/
-
+# experiments/
+/experiments/**/images/
 # Misc
 
 *.swp
 *.swo
 *.bak
 *~
+*.png
+*.jpg
+
+/.claude

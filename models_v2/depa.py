@@ -204,7 +204,7 @@ class DEPA(nn.Module):
             nn.Conv2d(channels, channels, 1),
         )
 
-        self.beta = nn.Parameter(torch.zeros(1, channels, 1, 1))
+        self.beta = nn.Parameter(torch.ones(1, channels, 1, 1)*0.05)  # Learnable residual scaling
 
     def forward(self, f_left: torch.Tensor, f_right: torch.Tensor) -> torch.Tensor:
         fl = self.norm_l(f_left)

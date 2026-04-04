@@ -31,7 +31,9 @@ def test(args):
     model = build_model_v2(args).to(device)
 
     if args.ckpt:
-        ckpt = torch.load(args.ckpt, map_location=device)
+        # PyTorch 2.6+ defaults to weights_only=True, which breaks loading older checkpoints with pickled objects.
+        # Setting weights_only=False restores the old behavior and fixes UnpicklingError for numpy scalars, etc.
+        ckpt = torch.load(args.ckpt, map_location=device, weights_only=False)
         model.load_state_dict(ckpt.get("model", ckpt), strict=False)
         logger.info(f"Loaded checkpoint: {args.ckpt}")
     else:
