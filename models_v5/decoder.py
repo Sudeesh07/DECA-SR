@@ -62,10 +62,15 @@ class ProgressiveReconstructionDecoder(nn.Module):
         self.to_hr = nn.Conv2d(c1, hr_channels, 1)
         self.hr_x2 = HRStage(hr_channels, hr_channels, hr_blocks[0])
         self.to_rgb_x2 = nn.Conv2d(hr_channels, out_channels, 3, padding=1)
+        # Zero-init final RGB conv so residual starts at 0 (output = bicubic at init)
+        nn.init.zeros_(self.to_rgb_x2.weight)
+        nn.init.zeros_(self.to_rgb_x2.bias)
 
         if scale == 4:
             self.hr_x4 = HRStage(hr_channels, hr_channels // 2, hr_blocks[1])
             self.to_rgb_x4 = nn.Conv2d(hr_channels // 2, out_channels, 3, padding=1)
+            nn.init.zeros_(self.to_rgb_x4.weight)
+            nn.init.zeros_(self.to_rgb_x4.bias)
         else:
             self.hr_x4 = None
             self.to_rgb_x4 = None

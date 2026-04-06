@@ -93,11 +93,31 @@ class DownsampleBlock(nn.Module):
         return self.net(x)
 
 
+def _icnr_init(conv: nn.Conv2d, scale: int = 2) -> None:
+    """ICNR initialization for sub-pixel convolution (Aitken et al., 2017).
+
+    Initializes the conv weight so that all sub-pixels in each scale×scale
+    block share the same value at init, producing a smooth (nearest-neighbour)
+    upscale instead of a checkerboard pattern.
+    """
+    out_c, in_c, h, w = conv.weight.shape
+    sub_c = out_c // (scale ** 2)
+    # Initialize a smaller kernel with kaiming, then repeat for sub-pixels
+    small = torch.empty(sub_c, in_c, h, w)
+    nn.init.kaiming_normal_(small, mode="fan_out", nonlinearity="relu")
+    kernel = small.repeat_interleave(scale ** 2, dim=0)
+    conv.weight.data.copy_(kernel)
+    if conv.bias is not None:
+        nn.init.zeros_(conv.bias)
+
+
 class UpsampleX2(nn.Module):
     def __init__(self, in_channels: int, out_channels: int):
         super().__init__()
+        conv = nn.Conv2d(in_channels, out_channels * 4, 3, padding=1)
+        _icnr_init(conv, scale=2)
         self.net = nn.Sequential(
-            nn.Conv2d(in_channels, out_channels * 4, 3, padding=1),
+            conv,
             nn.PixelShuffle(2),
         )
 
