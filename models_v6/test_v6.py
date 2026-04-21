@@ -5,8 +5,15 @@ import os
 import time
 
 import torch
+import torch.multiprocessing as mp
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
+
+# Avoid Docker /dev/shm bus-error failures in DataLoader workers.
+try:
+    mp.set_sharing_strategy("file_system")
+except RuntimeError:
+    pass
 
 from data.dataset import build_dataset
 from models_v6 import build_model_v6, get_config_v6

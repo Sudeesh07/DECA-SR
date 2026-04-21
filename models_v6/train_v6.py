@@ -6,9 +6,16 @@ import random
 
 import numpy as np
 import torch
+import torch.multiprocessing as mp
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
+
+# Avoid Docker /dev/shm bus-error failures in DataLoader workers.
+try:
+    mp.set_sharing_strategy("file_system")
+except RuntimeError:
+    pass
 
 from data.dataset import build_dataset
 from models_v6 import build_loss_v6, build_model_v6, get_config_v6

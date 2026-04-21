@@ -41,11 +41,24 @@ import random
 import numpy as np
 import torch
 import torch.distributed as dist
+import torch.multiprocessing as mp
 import torch.nn as nn
 import torch.optim as optim
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
+
+# DataLoader worker tensor-sharing strategy.
+# The default "file_descriptor" strategy uses /dev/shm for IPC; inside Docker
+# containers /dev/shm is often capped at 64 MB, which causes "Bus error" /
+# "insufficient shared memory" failures once workers start streaming batches.
+# "file_system" uses filesystem-backed file descriptors, which is immune to
+# the /dev/shm size cap at a small throughput cost.
+try:
+    mp.set_sharing_strategy("file_system")
+except RuntimeError:
+    # Already set elsewhere — harmless.
+    pass
 
 from data.dataset import build_dataset
 from models_v6 import build_loss_v6, build_model_v6, get_config_v6
