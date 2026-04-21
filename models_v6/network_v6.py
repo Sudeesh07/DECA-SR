@@ -1,0 +1,148 @@
+"""StereoSR V6 (SpecFuse): clean, shared-weight trunk + single tail upsample.
+
+Macro-architecture
+------------------
+    LR_L, LR_R  ──► stem ──► [SpectralStereoBlock] × N ──► tail ──► SR_L, SR_R
+                                                                         ▲
+                             all at LR resolution                        │
+                                                        + Bicubic(LR) ───┘
+
+Design principles
+-----------------
+* **Trunk operates entirely at LR resolution.** No encoder-decoder; no cascaded
+  PixelShuffle. The HR representation is constructed only at the tail via a
+  single sub-pixel convolution, avoiding the compounding checkerboard artefacts
+  present in U-Net SR designs.
+* **Shared weights across views.** Both L and R pass through the same trunk,
+  enforcing view symmetry and halving the parameter budget (vs. separate towers).
+* **Zero-init every residual.** Each SpectralStereoBlock starts as the identity
+  (NAFBlock β,γ=0; SCAM β,γ=0; CVSFM γ=0). The full network at step 0 produces
+  `bicubic(LR) + 0` ≡ pure bicubic upscale.
+* **Cross-view fusion at every block.** Each block runs NAFBlock per-view, then
+  SCAM (spatial), then CVSFM (spectral). SCAM and CVSFM are complementary:
+  SCAM aligns pixels along epipolar rows; CVSFM exchanges shared appearance in
+  the Fourier magnitude domain.
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Any
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+from .blocks import LayerNorm2d, NAFBlock, TailUpsample
+from .epipolar_attention import StereoCrossAttention
+from .spectral_fusion import CrossViewSpectralFusion
+
+
+@dataclass
+class StereoSRV6Output:
+    sr_left: torch.Tensor
+    sr_right: torch.Tensor
+    aux: dict[str, torch.Tensor]
+
+
+class SpectralStereoBlock(nn.Module):
+    """One trunk block: per-view NAFBlock → SCAM → CVSFM."""
+
+    def __init__(
+        self,
+        channels: int,
+        dw_expansion: float = 2.0,
+        ffn_expansion: float = 2.0,
+        use_scam: bool = True,
+        use_cvsfm: bool = True,
+    ):
+        super().__init__()
+        # Shared per-view spatial processor (single weight set for both L and R).
+        self.naf = NAFBlock(channels, dw_expansion, ffn_expansion)
+        self.scam = StereoCrossAttention(channels) if use_scam else None
+        self.cvsfm = CrossViewSpectralFusion(channels) if use_cvsfm else None
+
+    def forward(self, x_l: torch.Tensor, x_r: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        # Per-view spatial processing (shared weights).
+        x_l = self.naf(x_l)
+        x_r = self.naf(x_r)
+        # Spatial cross-view fusion (epipolar attention).
+        if self.scam is not None:
+            x_l, x_r = self.scam(x_l, x_r)
+        # Spectral cross-view fusion (magnitude fusion, phase preservation).
+        if self.cvsfm is not None:
+            x_l, x_r = self.cvsfm(x_l, x_r)
+        return x_l, x_r
+
+
+class StereoSRV6(nn.Module):
+    """SpecFuse: spectral cross-view fusion for stereo super-resolution."""
+
+    def __init__(
+        self,
+        scale: int = 4,
+        in_channels: int = 3,
+        channels: int = 64,
+        num_blocks: int = 20,
+        dw_expansion: float = 2.0,
+        ffn_expansion: float = 2.0,
+        use_scam: bool = True,
+        use_cvsfm: bool = True,
+    ):
+        super().__init__()
+        if scale not in (2, 3, 4):
+            raise ValueError(f"scale must be 2, 3, or 4 (got {scale})")
+        self.scale = scale
+
+        # Shared stem (same Conv3x3 applied to both views).
+        self.stem = nn.Conv2d(in_channels, channels, 3, padding=1)
+
+        # Shared trunk (each block processes both views).
+        self.trunk = nn.ModuleList([
+            SpectralStereoBlock(
+                channels=channels,
+                dw_expansion=dw_expansion,
+                ffn_expansion=ffn_expansion,
+                use_scam=use_scam,
+                use_cvsfm=use_cvsfm,
+            )
+            for _ in range(num_blocks)
+        ])
+
+        # Optional: a trunk-level LayerNorm to stabilise deep stacks.
+        self.trunk_norm = LayerNorm2d(channels)
+
+        # Single tail upsample: Conv3x3 → PixelShuffle(scale). ICNR-initialised.
+        self.tail = TailUpsample(channels, in_channels, scale)
+
+    def _body(self, x: torch.Tensor) -> torch.Tensor:
+        """Stem for a single view (to be called on L and R separately)."""
+        return self.stem(x)
+
+    def forward(self, left: torch.Tensor, right: torch.Tensor) -> StereoSRV6Output:
+        if left.shape != right.shape:
+            raise ValueError(f"Left/right shapes must match: {left.shape} vs {right.shape}")
+        lr_l_in, lr_r_in = left, right
+
+        # Shared stem.
+        x_l = self.stem(left)
+        x_r = self.stem(right)
+
+        # Shared trunk — cross-view fusion happens inside each block.
+        for block in self.trunk:
+            x_l, x_r = block(x_l, x_r)
+
+        x_l = self.trunk_norm(x_l)
+        x_r = self.trunk_norm(x_r)
+
+        # Tail: single PixelShuffle upsample.
+        pred_l = self.tail(x_l)
+        pred_r = self.tail(x_r)
+
+        # Global bicubic residual — network learns the HR residual only.
+        up_l = F.interpolate(lr_l_in, scale_factor=self.scale, mode="bicubic", align_corners=False)
+        up_r = F.interpolate(lr_r_in, scale_factor=self.scale, mode="bicubic", align_corners=False)
+
+        sr_l = pred_l + up_l
+        sr_r = pred_r + up_r
+
+        return StereoSRV6Output(sr_left=sr_l, sr_right=sr_r, aux={})
