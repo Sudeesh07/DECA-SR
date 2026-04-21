@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import os
 import random
+import shutil
 
 import numpy as np
 import torch
@@ -48,16 +49,49 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 
-# DataLoader worker tensor-sharing strategy.
-# The default "file_descriptor" strategy uses /dev/shm for IPC; inside Docker
-# containers /dev/shm is often capped at 64 MB, which causes "Bus error" /
-# "insufficient shared memory" failures once workers start streaming batches.
-# "file_system" uses filesystem-backed file descriptors, which is immune to
-# the /dev/shm size cap at a small throughput cost.
+
+def _shm_free_mb() -> float:
+    """Return free space on /dev/shm in MB (used by DataLoader IPC on Linux)."""
+    try:
+        return shutil.disk_usage("/dev/shm").free / (1024 * 1024)
+    except (FileNotFoundError, OSError):
+        return float("inf")  # non-Linux or /dev/shm missing — don't downgrade
+
+
+def _maybe_force_inprocess_loading(args) -> None:
+    """Force num_workers=0 when /dev/shm is too small to host IPC buffers.
+
+    Docker containers default to 64 MB /dev/shm which cannot hold even one
+    batch of stereo patches. Rather than SIGBUS'ing mid-training, we detect
+    the shortage up-front and fall back to in-process (zero-worker) loading.
+    """
+    if getattr(args, "num_workers", 0) <= 0:
+        return
+    free_mb = _shm_free_mb()
+    # Rough per-worker budget: one batch of float32 tensors.
+    # (lr + hr) × 2 views × batch × patch_h × patch_w × scale² × 4 bytes each.
+    per_worker_mb = (
+        2 * 2 * args.batch_size
+        * args.patch_h * args.patch_w
+        * (1 + args.scale ** 2) * 4
+    ) / (1024 * 1024)
+    needed_mb = per_worker_mb * args.num_workers * 2  # ×2 for double-buffer
+    if free_mb < max(needed_mb, 512):
+        print(
+            f"[shm-guard] /dev/shm has only {free_mb:.0f} MB free "
+            f"(need ~{needed_mb:.0f} MB for {args.num_workers} workers). "
+            f"Forcing num_workers=0 to avoid SIGBUS / ENOSPC. "
+            f"Remount /dev/shm or restart container with --shm-size=16g to re-enable workers.",
+            flush=True,
+        )
+        args.num_workers = 0
+
+
+# Prefer file_system strategy — more resilient to fd limits; same /dev/shm
+# backing on Linux but safer under abrupt worker death.
 try:
     mp.set_sharing_strategy("file_system")
 except RuntimeError:
-    # Already set elsewhere — harmless.
     pass
 
 from data.dataset import build_dataset
@@ -170,6 +204,9 @@ def train(args):
 
     if world_size > 1:
         dist.init_process_group(backend="nccl")
+
+    # Auto-fallback to in-process loading when /dev/shm is too small.
+    _maybe_force_inprocess_loading(args)
 
     set_seed(args.seed, rank)
 

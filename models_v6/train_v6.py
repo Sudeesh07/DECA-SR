@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import random
+import shutil
 
 import numpy as np
 import torch
@@ -11,11 +12,33 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
 
-# Avoid Docker /dev/shm bus-error failures in DataLoader workers.
 try:
     mp.set_sharing_strategy("file_system")
 except RuntimeError:
     pass
+
+
+def _maybe_force_inprocess_loading(args) -> None:
+    """Auto-fallback to num_workers=0 when /dev/shm is too small (Docker 64 MB default)."""
+    if getattr(args, "num_workers", 0) <= 0:
+        return
+    try:
+        free_mb = shutil.disk_usage("/dev/shm").free / (1024 * 1024)
+    except (FileNotFoundError, OSError):
+        return
+    per_worker_mb = (
+        2 * 2 * args.batch_size
+        * args.patch_h * args.patch_w
+        * (1 + args.scale ** 2) * 4
+    ) / (1024 * 1024)
+    needed_mb = per_worker_mb * args.num_workers * 2
+    if free_mb < max(needed_mb, 512):
+        print(
+            f"[shm-guard] /dev/shm has only {free_mb:.0f} MB free "
+            f"(need ~{needed_mb:.0f} MB). Forcing num_workers=0.",
+            flush=True,
+        )
+        args.num_workers = 0
 
 from data.dataset import build_dataset
 from models_v6 import build_loss_v6, build_model_v6, get_config_v6
@@ -84,6 +107,7 @@ def train(args):
     autocast_device = "cuda" if device.type == "cuda" else "cpu"
     logger = setup_logger(args.output_dir, name="stereo_sr_v6")
     logger.info(f"Config: {args}")
+    _maybe_force_inprocess_loading(args)
     set_seed(args.seed)
 
     model = build_model_v6(args).to(device)
