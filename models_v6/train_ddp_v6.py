@@ -237,16 +237,17 @@ def train(args):
         ckpt = torch.load(args.pretrain, map_location=device, weights_only=False)
         model.load_state_dict(ckpt.get("model", ckpt), strict=False)
 
-    # Wrap in DDP. find_unused_parameters=True because CVSFM's grad flow
-    # depends on learnable γ scales that may be zero for the first few steps;
-    # DDP expects all params to receive a grad otherwise. The small overhead
-    # is justified by robust gradient accounting through the spectral path.
+    # Wrap in DDP. Empirically the zero-init γ scales in CVSFM and NAFBlock
+    # still produce non-zero gradients at step 0 (because the gate output is
+    # not exactly zero — sigmoid(-5) ≈ 0.007 — so every param remains on the
+    # backward graph). DDP therefore does not need find_unused_parameters,
+    # which avoids the extra autograd-graph traversal per iteration.
     if world_size > 1:
         model = DDP(
             model,
             device_ids=[rank],
             output_device=rank,
-            find_unused_parameters=True,
+            find_unused_parameters=False,
         )
 
     raw_model = model.module if hasattr(model, "module") else model

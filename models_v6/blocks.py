@@ -112,25 +112,39 @@ def icnr_init(conv: nn.Conv2d, scale: int) -> None:
 class TailUpsample(nn.Module):
     """Single PixelShuffle upsample at the network tail.
 
-    Initialisation is ICNR (Aitken et al., 2017): sub-pixel-sharing init that
-    produces a smooth (nearest-neighbour-like) upscale at init, preventing the
-    checkerboard pattern typical of randomly-initialised PixelShuffle layers.
+    Initialisation
+    --------------
+    We apply ICNR (Aitken et al., 2017) — sub-pixel-sharing init that avoids
+    checkerboard — and then scale the weights by ``init_scale`` (default 0.01).
 
-    Importantly we do **not** zero-initialise this conv. In a network with a
-    global bicubic residual, zero-init would null out ∂loss/∂(trunk), leaving
-    the entire trunk without gradient signal. Instead we rely on zero-init
-    residual scales *inside each trunk block* (β, γ, γ_L, γ_R) to keep the
-    blocks close to identity at step 0 while the tail still provides the
-    gradient path the trunk needs.
+    The small scale is critical for networks with a **global bicubic residual**
+    (``SR = tail(trunk(LR)) + bicubic(LR)``). Without it, the tail output has
+    std ≈ 1.4 per pixel at init, which dominates the bicubic baseline and
+    produces nonsense initial SR (PSNR ~8 dB, pixel loss ~10). With it, the
+    initial residual is ~0.014 per pixel, so ``SR_init ≈ bicubic(LR)`` and the
+    network trains *up* from the bicubic baseline (~24 dB at step 0).
+
+    Zero-init the weights outright would break gradient flow to the trunk
+    (∂loss/∂trunk = tail.weightᵀ · loss_grad vanishes). A small non-zero scale
+    keeps gradients flowing while starting close to the identity-to-bicubic map.
     """
 
-    def __init__(self, in_channels: int, out_channels: int, scale: int):
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        scale: int,
+        init_scale: float = 0.01,
+    ):
         super().__init__()
         if scale not in (2, 3, 4):
             raise ValueError(f"scale must be 2, 3, or 4 (got {scale})")
         self.scale = scale
         self.conv = nn.Conv2d(in_channels, out_channels * (scale ** 2), 3, padding=1)
         icnr_init(self.conv, scale=scale)
+        with torch.no_grad():
+            self.conv.weight.mul_(init_scale)
+        nn.init.zeros_(self.conv.bias)
         self.shuffle = nn.PixelShuffle(scale)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
