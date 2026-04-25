@@ -325,10 +325,35 @@ def train(args):
                 psnr_meter.update(psnr, lr_l.size(0))
                 ssim_meter.update(ssim, lr_l.size(0))
 
+        # NaN/Inf guard: skip this iteration if AMP fp16 produced a non-finite
+        # loss, otherwise the bad value would propagate into the weights via
+        # backward + optimizer.step and corrupt the entire model permanently.
+        if not torch.isfinite(loss):
+            if is_main() and iteration % args.log_interval == 0:
+                logger.warning(
+                    f"Iter {iteration}: non-finite loss ({loss.item()}), skipping step"
+                )
+            # Clear any partial gradient state and force AMP scaler to back off.
+            optimizer.zero_grad(set_to_none=True)
+            scaler.update()
+            scheduler.step()
+            continue
+
         scaler.scale(loss).backward()
         if args.grad_clip > 0:
             scaler.unscale_(optimizer)
-            nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+            # Second guard: skip if gradient norm is non-finite even after
+            # AMP unscaling (catches inf gradients that GradScaler missed).
+            grad_norm = nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+            if not torch.isfinite(grad_norm):
+                if is_main() and iteration % args.log_interval == 0:
+                    logger.warning(
+                        f"Iter {iteration}: non-finite grad norm ({grad_norm.item()}), skipping step"
+                    )
+                optimizer.zero_grad(set_to_none=True)
+                scaler.update()
+                scheduler.step()
+                continue
         scaler.step(optimizer)
         scaler.update()
         scheduler.step()

@@ -41,12 +41,21 @@ class StereoCrossAttention(nn.Module):
         Vr = self.v_r(x_r).permute(0, 2, 3, 1)                    # [B, H, W, C]
 
         # Attention along the epipolar (width) axis, per row.
-        attn = torch.matmul(Ql, Qr_T) * self.scale                # [B, H, W, W]
+        # Compute attention scores + softmax in fp32 even under AMP. fp16's
+        # ~65k dynamic range overflows on long-tail Q·Kᵀ values; once exp()
+        # produces inf, softmax → NaN and corrupts weights via backward.
+        with torch.amp.autocast("cuda", enabled=False):
+            Ql_f = Ql.float()
+            QrT_f = Qr_T.float()
+            attn = torch.matmul(Ql_f, QrT_f) * self.scale          # [B, H, W, W]
+            attn_r2l = F.softmax(attn, dim=-1)
+            attn_l2r = F.softmax(attn.transpose(-2, -1), dim=-1)
 
-        # Right → Left direction (left queries, right values)
-        F_r2l = torch.matmul(F.softmax(attn, dim=-1), Vr)         # [B, H, W, C]
-        # Left → Right direction (right queries, left values)
-        F_l2r = torch.matmul(F.softmax(attn.permute(0, 1, 3, 2), dim=-1), Vl)
+        attn_r2l = attn_r2l.to(Vr.dtype)
+        attn_l2r = attn_l2r.to(Vl.dtype)
+
+        F_r2l = torch.matmul(attn_r2l, Vr)                        # [B, H, W, C]
+        F_l2r = torch.matmul(attn_l2r, Vl)
 
         F_r2l = F_r2l.permute(0, 3, 1, 2) * self.beta             # [B, C, H, W]
         F_l2r = F_l2r.permute(0, 3, 1, 2) * self.gamma
