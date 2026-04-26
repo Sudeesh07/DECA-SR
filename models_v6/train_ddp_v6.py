@@ -444,9 +444,14 @@ def train(args):
             psnr_meter.reset()
             ssim_meter.reset()
 
-        # ── Validation (rank 0 only) ─────────────────────────────────
-        if iteration > 0 and iteration % args.val_interval == 0 and val_loader is not None:
-            if is_main():
+        # ── Validation (rank 0 only, barrier on ALL ranks) ───────────
+        # Gating condition must be identical on every rank so all ranks reach
+        # the barrier together. Previously we tested ``val_loader is not None``
+        # which is True only on rank 0 (val_loader is built rank-0-only),
+        # causing rank 1 to skip the barrier entirely and the next collective
+        # to deadlock until NCCL_TIMEOUT.
+        if iteration > 0 and iteration % args.val_interval == 0:
+            if is_main() and val_loader is not None:
                 psnr_val, ssim_val = validate(model, val_loader, device, logger)
                 if writer is not None:
                     writer.add_scalar("val/psnr", psnr_val, iteration)
@@ -457,9 +462,7 @@ def train(args):
                         os.path.join(args.output_dir, "checkpoints", "best.pth"),
                         raw_model, optimizer, scheduler, iteration, best_psnr, logger,
                     )
-            # ALL ranks synchronise here. Validation can take many minutes;
-            # without this barrier rank 1 races ahead and may trip the NCCL
-            # timeout on the next collective.
+            # ALL ranks synchronise here.
             if world_size > 1:
                 dist.barrier()
 
