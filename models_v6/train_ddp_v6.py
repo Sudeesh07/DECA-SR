@@ -325,35 +325,36 @@ def train(args):
                 psnr_meter.update(psnr, lr_l.size(0))
                 ssim_meter.update(ssim, lr_l.size(0))
 
-        # NaN/Inf guard: skip this iteration if AMP fp16 produced a non-finite
-        # loss, otherwise the bad value would propagate into the weights via
-        # backward + optimizer.step and corrupt the entire model permanently.
-        if not torch.isfinite(loss):
+        # NaN/Inf guard: skip this iteration if the forward produced a
+        # non-finite loss. Otherwise calling backward()+step() would propagate
+        # the bad value into the weights and corrupt the model permanently.
+        # All DDP ranks must agree on the skip decision, so we all-reduce a
+        # finite-flag (min: 0 if any rank has NaN/Inf, 1 if all are finite).
+        finite_flag = torch.tensor([1.0 if torch.isfinite(loss) else 0.0], device=device)
+        if world_size > 1:
+            dist.all_reduce(finite_flag, op=dist.ReduceOp.MIN)
+
+        if finite_flag.item() < 1.0:
             if is_main() and iteration % args.log_interval == 0:
                 logger.warning(
-                    f"Iter {iteration}: non-finite loss ({loss.item()}), skipping step"
+                    f"Iter {iteration}: non-finite loss detected, skipping step"
                 )
-            # Clear any partial gradient state and force AMP scaler to back off.
+            # Don't touch scaler — scaler.scale()/backward() never ran, so
+            # there's no inf-check state to consume. Advance the LR schedule
+            # to keep the cosine plan on track.
             optimizer.zero_grad(set_to_none=True)
-            scaler.update()
             scheduler.step()
             continue
 
         scaler.scale(loss).backward()
         if args.grad_clip > 0:
             scaler.unscale_(optimizer)
-            # Second guard: skip if gradient norm is non-finite even after
-            # AMP unscaling (catches inf gradients that GradScaler missed).
-            grad_norm = nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-            if not torch.isfinite(grad_norm):
-                if is_main() and iteration % args.log_interval == 0:
-                    logger.warning(
-                        f"Iter {iteration}: non-finite grad norm ({grad_norm.item()}), skipping step"
-                    )
-                optimizer.zero_grad(set_to_none=True)
-                scaler.update()
-                scheduler.step()
-                continue
+            # Note: nn.utils.clip_grad_norm_ may return inf when AMP produces
+            # non-finite gradients; that's OK because scaler.step(optimizer)
+            # below detects inf gradients via its own inf-check and silently
+            # skips the optimizer step (and scaler.update() then backs off
+            # the loss scale). No manual skip needed.
+            nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
         scaler.step(optimizer)
         scaler.update()
         scheduler.step()
