@@ -66,6 +66,10 @@ def _add_common_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--log_interval", type=int, default=100)
     parser.add_argument("--val_interval", type=int, default=2500)
     parser.add_argument("--save_interval", type=int, default=5000)
+    parser.add_argument("--keep_ckpts", type=int, default=5,
+                        help="Keep the last N periodic iter_*.pth checkpoints; "
+                             "older ones are pruned. best.pth and final.pth are "
+                             "always kept. Set to 0 to disable pruning.")
 
     # Evaluation
     parser.add_argument("--ckpt", type=str, default=None)

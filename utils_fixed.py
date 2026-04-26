@@ -94,6 +94,14 @@ def setup_logger(output_dir: str, name: str = "stereo_sr"):
 
 
 def save_checkpoint(path, model, optimizer, scheduler, iteration: int, best_psnr: float, logger):
+    """Atomic checkpoint save.
+
+    torch.save is *not* atomic: if interrupted (SIGTERM, OOM, disk-full mid-write),
+    the destination .pth ends up truncated/corrupt and resumes break. We write to
+    a sibling .tmp file first and rename-into-place — rename on POSIX is atomic
+    on the same filesystem, so the destination is either the old or new full file
+    at any instant.
+    """
     state = {
         "model": model.state_dict(),
         "optimizer": optimizer.state_dict(),
@@ -101,8 +109,55 @@ def save_checkpoint(path, model, optimizer, scheduler, iteration: int, best_psnr
         "iteration": iteration,
         "best_psnr": best_psnr,
     }
-    torch.save(state, path)
-    logger.info(f"Checkpoint saved: {path}")
+    tmp_path = path + ".tmp"
+    try:
+        torch.save(state, tmp_path)
+        os.replace(tmp_path, path)
+        if logger is not None:
+            logger.info(f"Checkpoint saved: {path}")
+    except (OSError, RuntimeError) as exc:
+        if logger is not None:
+            logger.error(f"Checkpoint save FAILED at {path}: {exc}")
+        # Clean up partial tmp file if we can.
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except OSError:
+            pass
+        # Don't re-raise — a failed save shouldn't kill training.
+
+
+def prune_checkpoints(directory: str, keep_last: int, logger=None):
+    """Keep only the most-recent ``keep_last`` periodic ``iter_*.pth`` files.
+
+    Prevents disk exhaustion over a 400k-iter run where save_interval=5000
+    would otherwise produce 80 checkpoints (~2 GB total). ``best.pth`` and
+    ``final.pth`` are always kept.
+    """
+    if keep_last <= 0:
+        return
+    try:
+        entries = []
+        for name in os.listdir(directory):
+            if not name.startswith("iter_") or not name.endswith(".pth"):
+                continue
+            try:
+                step = int(name[len("iter_"):-len(".pth")])
+            except ValueError:
+                continue
+            entries.append((step, os.path.join(directory, name)))
+        entries.sort(key=lambda x: x[0], reverse=True)  # newest first
+        for _, p in entries[keep_last:]:
+            try:
+                os.remove(p)
+                if logger is not None:
+                    logger.info(f"Pruned old checkpoint: {p}")
+            except OSError as exc:
+                if logger is not None:
+                    logger.warning(f"Failed to prune {p}: {exc}")
+    except OSError as exc:
+        if logger is not None:
+            logger.warning(f"prune_checkpoints scan failed: {exc}")
 
 
 def load_checkpoint(path, model, optimizer=None, scheduler=None, device: str = "cuda", logger=None):

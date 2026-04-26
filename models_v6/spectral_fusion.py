@@ -84,6 +84,13 @@ class CrossViewSpectralFusion(nn.Module):
             fused_mag_l = alpha_l * mag_r + (1.0 - alpha_l) * mag_l
             fused_mag_r = alpha_r * mag_l + (1.0 - alpha_r) * mag_r
 
+            # Numerical safety: clamp to a small floor so torch.polar's
+            # backward pass through atan2(0,0) cannot inject NaN gradients
+            # in pathological underflow cases. The floor (1e-8 in fp32) is
+            # well below any signal magnitude we care about.
+            fused_mag_l = fused_mag_l.clamp_min(1e-8)
+            fused_mag_r = fused_mag_r.clamp_min(1e-8)
+
             # Reconstruct complex spectrum with view-specific phase.
             F_l_new = torch.polar(fused_mag_l, phase_l)
             F_r_new = torch.polar(fused_mag_r, phase_r)

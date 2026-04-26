@@ -101,9 +101,17 @@ from utils_fixed import (
     compute_psnr,
     compute_ssim,
     load_checkpoint,
+    prune_checkpoints,
     save_checkpoint,
     setup_logger,
 )
+
+# Increase NCCL collective timeout from the default 10/30 min to 1 hour. Long
+# validation passes on rank 0 (with the other rank waiting at the next collective)
+# can otherwise trip the timeout and crash the whole job.
+os.environ.setdefault("TORCH_NCCL_BLOCKING_WAIT", "1")
+os.environ.setdefault("TORCH_NCCL_ASYNC_ERROR_HANDLING", "1")
+os.environ.setdefault("NCCL_TIMEOUT", "3600")
 
 
 # ---------------------------------------------------------------------------
@@ -169,22 +177,36 @@ def validate(model: nn.Module, val_loader: DataLoader, device: torch.device, log
 
     psnr_meter = AverageMeter()
     ssim_meter = AverageMeter()
+    skipped = 0
 
     for batch in val_loader:
-        lr_l = batch["lr_left"].to(device)
-        lr_r = batch["lr_right"].to(device)
-        hr_l = batch["hr_left"].to(device)
-        hr_r = batch["hr_right"].to(device)
+        try:
+            lr_l = batch["lr_left"].to(device)
+            lr_r = batch["lr_right"].to(device)
+            hr_l = batch["hr_left"].to(device)
+            hr_r = batch["hr_right"].to(device)
 
-        output = raw_model(lr_l, lr_r)
-        sr_l = output.sr_left.clamp(0, 1)
-        sr_r = output.sr_right.clamp(0, 1)
+            output = raw_model(lr_l, lr_r)
+            sr_l = output.sr_left.clamp(0, 1)
+            sr_r = output.sr_right.clamp(0, 1)
 
-        psnr = 0.5 * (compute_psnr(sr_l, hr_l) + compute_psnr(sr_r, hr_r))
-        ssim = 0.5 * (compute_ssim(sr_l, hr_l) + compute_ssim(sr_r, hr_r))
-        psnr_meter.update(psnr, lr_l.size(0))
-        ssim_meter.update(ssim, lr_l.size(0))
+            psnr = 0.5 * (compute_psnr(sr_l, hr_l) + compute_psnr(sr_r, hr_r))
+            ssim = 0.5 * (compute_ssim(sr_l, hr_l) + compute_ssim(sr_r, hr_r))
+            psnr_meter.update(psnr, lr_l.size(0))
+            ssim_meter.update(ssim, lr_l.size(0))
+        except torch.cuda.OutOfMemoryError as exc:
+            # Some Flickr1024 images are large (≥ 1500×800 HR); a single one
+            # OOMing shouldn't crash a 400k-iter training run. Drop the image
+            # and free what we can.
+            skipped += 1
+            torch.cuda.empty_cache()
+            logger.warning(f"Validation: skipped one sample (OOM): {exc}")
+        except Exception as exc:
+            skipped += 1
+            logger.warning(f"Validation: skipped one sample (error): {exc}")
 
+    if skipped:
+        logger.warning(f"Validation: skipped {skipped} samples")
     logger.info(f"Validation - PSNR: {psnr_meter.avg:.4f} dB, SSIM: {ssim_meter.avg:.4f}")
     raw_model.train()
     return psnr_meter.avg, ssim_meter.avg
@@ -314,14 +336,36 @@ def train(args):
     data_iter = iter(train_loader)
 
     model.train()
+    consecutive_loader_failures = 0
     for iteration in range(start_iter, args.total_iters):
-        try:
-            batch = next(data_iter)
-        except StopIteration:
-            epoch += 1
-            train_sampler.set_epoch(epoch)
-            data_iter = iter(train_loader)
-            batch = next(data_iter)
+        # Robust batch fetch: a single corrupt PNG / decode error in the dataset
+        # should not kill a 400k-iter run. We skip and retry up to a few times
+        # before giving up.
+        batch = None
+        for _ in range(5):
+            try:
+                try:
+                    batch = next(data_iter)
+                except StopIteration:
+                    epoch += 1
+                    train_sampler.set_epoch(epoch)
+                    data_iter = iter(train_loader)
+                    batch = next(data_iter)
+                consecutive_loader_failures = 0
+                break
+            except Exception as exc:
+                consecutive_loader_failures += 1
+                if is_main():
+                    logger.warning(
+                        f"Iter {iteration}: dataloader failure "
+                        f"({type(exc).__name__}: {exc}); retrying"
+                    )
+                if consecutive_loader_failures > 50:
+                    if is_main():
+                        logger.error("Too many consecutive dataloader failures, aborting")
+                    raise
+        if batch is None:
+            continue
 
         lr_l = batch["lr_left"].to(device, non_blocking=True)
         lr_r = batch["lr_right"].to(device, non_blocking=True)
@@ -401,28 +445,48 @@ def train(args):
             ssim_meter.reset()
 
         # ── Validation (rank 0 only) ─────────────────────────────────
-        if is_main() and iteration > 0 and iteration % args.val_interval == 0 and val_loader is not None:
-            psnr_val, ssim_val = validate(model, val_loader, device, logger)
-            if writer is not None:
-                writer.add_scalar("val/psnr", psnr_val, iteration)
-                writer.add_scalar("val/ssim", ssim_val, iteration)
-            if psnr_val > best_psnr:
-                best_psnr = psnr_val
-                save_checkpoint(
-                    os.path.join(args.output_dir, "checkpoints", "best.pth"),
-                    raw_model, optimizer, scheduler, iteration, best_psnr, logger,
-                )
+        if iteration > 0 and iteration % args.val_interval == 0 and val_loader is not None:
+            if is_main():
+                psnr_val, ssim_val = validate(model, val_loader, device, logger)
+                if writer is not None:
+                    writer.add_scalar("val/psnr", psnr_val, iteration)
+                    writer.add_scalar("val/ssim", ssim_val, iteration)
+                if psnr_val > best_psnr:
+                    best_psnr = psnr_val
+                    save_checkpoint(
+                        os.path.join(args.output_dir, "checkpoints", "best.pth"),
+                        raw_model, optimizer, scheduler, iteration, best_psnr, logger,
+                    )
+            # ALL ranks synchronise here. Validation can take many minutes;
+            # without this barrier rank 1 races ahead and may trip the NCCL
+            # timeout on the next collective.
+            if world_size > 1:
+                dist.barrier()
 
         # ── Periodic checkpoint (rank 0 only) ────────────────────────
-        if is_main() and iteration > 0 and iteration % args.save_interval == 0:
-            save_checkpoint(
-                os.path.join(args.output_dir, "checkpoints", f"iter_{iteration}.pth"),
-                raw_model, optimizer, scheduler, iteration, best_psnr, logger,
-            )
+        if iteration > 0 and iteration % args.save_interval == 0:
+            if is_main():
+                save_checkpoint(
+                    os.path.join(args.output_dir, "checkpoints", f"iter_{iteration}.pth"),
+                    raw_model, optimizer, scheduler, iteration, best_psnr, logger,
+                )
+                # Keep only the most-recent ``keep_ckpts`` periodic checkpoints
+                # to bound disk usage. ``best.pth`` and ``final.pth`` survive.
+                prune_checkpoints(
+                    os.path.join(args.output_dir, "checkpoints"),
+                    keep_last=args.keep_ckpts,
+                    logger=logger,
+                )
+            # Sync all ranks after save so rank 1 doesn't race past while
+            # rank 0 is writing 25-30 MB to disk.
+            if world_size > 1:
+                dist.barrier()
 
-        # Sync all ranks at checkpoint boundaries
-        if world_size > 1 and iteration > 0 and iteration % args.save_interval == 0:
-            dist.barrier()
+        # Periodic GPU cache cleanup. Long runs can fragment the allocator and
+        # trigger spurious OOM warnings even when nominal usage is well under
+        # capacity. Cheap operation; runs only every save_interval steps.
+        if iteration > 0 and iteration % args.save_interval == 0 and device.type == "cuda":
+            torch.cuda.empty_cache()
 
     # ── Final ────────────────────────────────────────────────────────
     if is_main():
