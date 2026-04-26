@@ -266,7 +266,25 @@ def train(args):
 
     optimizer = build_optimizer(model, scaled_lr, args.weight_decay)
     scheduler = build_scheduler(optimizer, args)
-    scaler = torch.amp.GradScaler("cuda", enabled=args.fp16)
+
+    # AMP dtype selection.
+    # - bf16:  fp32-equivalent dynamic range, no GradScaler needed. RECOMMENDED
+    #          on H100/A100. Eliminates the fp16 overflow → NaN training death
+    #          that occurs ~30-50k iters into long runs.
+    # - fp16:  legacy fast-math; needs GradScaler; can overflow on long runs.
+    # - fp32:  --no_fp16 (and no --bf16). Slowest but rock solid.
+    use_bf16 = bool(getattr(args, "bf16", False))
+    use_fp16 = bool(args.fp16) and not use_bf16
+    amp_enabled = use_bf16 or use_fp16
+    amp_dtype = torch.bfloat16 if use_bf16 else torch.float16
+    # GradScaler is only needed for fp16 (loss scaling); bf16 has fp32 range so
+    # the scaler is a no-op and we skip it entirely.
+    scaler = torch.amp.GradScaler("cuda", enabled=use_fp16)
+    if is_main():
+        logger.info(
+            f"AMP dtype: {'bf16' if use_bf16 else ('fp16' if use_fp16 else 'fp32')} "
+            f"(scaler {'enabled' if use_fp16 else 'bypassed'})"
+        )
 
     start_iter = 0
     best_psnr = 0.0
@@ -311,7 +329,7 @@ def train(args):
         hr_r = batch["hr_right"].to(device, non_blocking=True)
 
         optimizer.zero_grad(set_to_none=True)
-        with torch.amp.autocast("cuda", enabled=args.fp16):
+        with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=amp_enabled):
             output = model(lr_l, lr_r)
             loss, loss_dict = criterion(
                 output.sr_left, output.sr_right, hr_l, hr_r, aux=output.aux
@@ -326,10 +344,8 @@ def train(args):
                 ssim_meter.update(ssim, lr_l.size(0))
 
         # NaN/Inf guard: skip this iteration if the forward produced a
-        # non-finite loss. Otherwise calling backward()+step() would propagate
-        # the bad value into the weights and corrupt the model permanently.
-        # All DDP ranks must agree on the skip decision, so we all-reduce a
-        # finite-flag (min: 0 if any rank has NaN/Inf, 1 if all are finite).
+        # non-finite loss. All DDP ranks must agree on the skip decision, so
+        # we all-reduce a finite-flag (min: 0 if any rank had NaN/Inf).
         finite_flag = torch.tensor([1.0 if torch.isfinite(loss) else 0.0], device=device)
         if world_size > 1:
             dist.all_reduce(finite_flag, op=dist.ReduceOp.MIN)
@@ -339,24 +355,24 @@ def train(args):
                 logger.warning(
                     f"Iter {iteration}: non-finite loss detected, skipping step"
                 )
-            # Don't touch scaler — scaler.scale()/backward() never ran, so
-            # there's no inf-check state to consume. Advance the LR schedule
-            # to keep the cosine plan on track.
             optimizer.zero_grad(set_to_none=True)
             scheduler.step()
             continue
 
-        scaler.scale(loss).backward()
-        if args.grad_clip > 0:
-            scaler.unscale_(optimizer)
-            # Note: nn.utils.clip_grad_norm_ may return inf when AMP produces
-            # non-finite gradients; that's OK because scaler.step(optimizer)
-            # below detects inf gradients via its own inf-check and silently
-            # skips the optimizer step (and scaler.update() then backs off
-            # the loss scale). No manual skip needed.
-            nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-        scaler.step(optimizer)
-        scaler.update()
+        # Backward + step. Two paths: with or without GradScaler.
+        if use_fp16:
+            scaler.scale(loss).backward()
+            if args.grad_clip > 0:
+                scaler.unscale_(optimizer)
+                nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            # bf16 or fp32 — no loss scaling needed.
+            loss.backward()
+            if args.grad_clip > 0:
+                nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+            optimizer.step()
         scheduler.step()
 
         # ── Logging (rank 0 only) ────────────────────────────────────

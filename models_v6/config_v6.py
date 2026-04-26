@@ -45,6 +45,11 @@ def _add_common_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--grad_clip", type=float, default=1.0)
     parser.add_argument("--fp16", action="store_true", default=True)
     parser.add_argument("--no_fp16", action="store_false", dest="fp16")
+    parser.add_argument("--bf16", action="store_true", default=False,
+                        help="Use bf16 AMP (recommended on H100/A100/Ampere+). "
+                             "Same speed as fp16 but with fp32 dynamic range — "
+                             "eliminates the inf/NaN overflows that fp16 suffers "
+                             "during long training runs. GradScaler is bypassed.")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--resume", type=str, default=None)
     parser.add_argument("--pretrain", type=str, default=None)
