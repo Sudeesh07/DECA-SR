@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 import time
 
 import torch
@@ -14,6 +15,17 @@ try:
     mp.set_sharing_strategy("file_system")
 except RuntimeError:
     pass
+
+
+def _shm_constrained() -> bool:
+    """True when /dev/shm is too small for DataLoader IPC of HR test samples."""
+    try:
+        free_mb = shutil.disk_usage("/dev/shm").free / (1024 * 1024)
+    except (FileNotFoundError, OSError):
+        return False
+    # Test images are full-resolution; one HR sample can be 10-30 MB. With
+    # any workers, a few prefetched batches easily exceed a 64-128 MB shm cap.
+    return free_mb < 512
 
 from data.dataset import build_dataset
 from models_v6 import build_model_v6, get_config_v6
@@ -37,7 +49,15 @@ def test(args):
 
     model.eval()
     test_dataset = build_dataset(args, split="test")
-    test_loader = DataLoader(test_dataset, batch_size=1, shuffle=False, num_workers=min(2, args.num_workers))
+    # Eval streams full-resolution HR samples. Auto-fallback to 0 workers if
+    # /dev/shm is too small to host inter-process tensor IPC (Docker 64 MB).
+    test_workers = min(2, args.num_workers)
+    if test_workers > 0 and _shm_constrained():
+        logger.warning(
+            "[shm-guard] /dev/shm < 512 MB free; forcing num_workers=0 for eval."
+        )
+        test_workers = 0
+    test_loader = DataLoader(test_dataset, batch_size=1, shuffle=False, num_workers=test_workers)
     logger.info(f"Test set: {len(test_dataset)} samples, scale={args.scale}")
 
     psnr_meter = AverageMeter()
