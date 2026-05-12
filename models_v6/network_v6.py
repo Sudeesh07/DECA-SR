@@ -118,6 +118,25 @@ class StereoSRV6(nn.Module):
         """Stem for a single view (to be called on L and R separately)."""
         return self.stem(x)
 
+    def enable_tlsc(self, base_size) -> int:
+        """Enable inference-time Test-time Local Statistics Correction.
+
+        Swaps each NAFBlock's SCA global pool for a windowed local pool of
+        size ``base_size`` (use the training LR patch shape, e.g.
+        ``(patch_h, patch_w)``). Returns the number of pool layers replaced.
+        Idempotent — calling twice is a no-op. Call AFTER loading weights and
+        BEFORE evaluation.
+        """
+        from .tlsc import enable_tlsc as _enable_tlsc
+
+        return _enable_tlsc(self, base_size)
+
+    def disable_tlsc(self) -> int:
+        """Revert TLSC: restore global ``AdaptiveAvgPool2d(1)`` in every SCA."""
+        from .tlsc import disable_tlsc as _disable_tlsc
+
+        return _disable_tlsc(self)
+
     def forward(self, left: torch.Tensor, right: torch.Tensor) -> StereoSRV6Output:
         if left.shape != right.shape:
             raise ValueError(f"Left/right shapes must match: {left.shape} vs {right.shape}")

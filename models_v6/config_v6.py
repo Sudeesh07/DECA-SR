@@ -74,7 +74,14 @@ def _add_common_args(parser: argparse.ArgumentParser) -> None:
     # Evaluation
     parser.add_argument("--ckpt", type=str, default=None)
     parser.add_argument("--save_images", action="store_true", default=False)
-    parser.add_argument("--tlsc", action="store_true", default=False)
+    parser.add_argument("--tlsc", action="store_true", default=False,
+                        help="Enable inference-time TLSC (Chu et al., ECCV-W 2022): "
+                             "swap NAFBlock SCA global pool for a windowed local pool "
+                             "sized to the training LR patch.")
+    parser.add_argument("--tlsc_base_h", type=int, default=None,
+                        help="TLSC pool window height (defaults to --patch_h).")
+    parser.add_argument("--tlsc_base_w", type=int, default=None,
+                        help="TLSC pool window width (defaults to --patch_w).")
 
 
 def get_config_v6(argv: list[str] | None = None) -> argparse.Namespace:

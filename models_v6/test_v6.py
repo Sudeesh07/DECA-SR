@@ -29,7 +29,7 @@ def _shm_constrained() -> bool:
 
 from data.dataset import build_dataset
 from models_v6 import build_model_v6, get_config_v6
-from utils_fixed import AverageMeter, TLSC, compute_psnr, compute_ssim, save_image, setup_logger
+from utils_fixed import AverageMeter, compute_psnr, compute_ssim, save_image, setup_logger
 
 
 @torch.no_grad()
@@ -47,6 +47,19 @@ def test(args):
     else:
         logger.warning("No checkpoint specified; evaluating random weights.")
 
+    # ── Test-time Local Statistics Correction (TLSC) ─────────────────
+    # Replace each NAFBlock's SCA global pool with a local windowed pool
+    # sized to the training LR patch (Chu et al., ECCV-W 2022).
+    # Applied AFTER loading weights, BEFORE model.eval().
+    if args.tlsc:
+        base_h = getattr(args, "tlsc_base_h", None) or args.patch_h
+        base_w = getattr(args, "tlsc_base_w", None) or args.patch_w
+        n_replaced = model.enable_tlsc((base_h, base_w))
+        logger.info(
+            f"TLSC enabled: replaced {n_replaced} global pools with "
+            f"LocalAvgPool2d(base_size=({base_h}, {base_w}))"
+        )
+
     model.eval()
     test_dataset = build_dataset(args, split="test")
     # Eval streams full-resolution HR samples. Auto-fallback to 0 workers if
@@ -63,7 +76,6 @@ def test(args):
     psnr_meter = AverageMeter()
     ssim_meter = AverageMeter()
     time_meter = AverageMeter()
-    tlsc = TLSC() if args.tlsc else None
 
     for index, batch in enumerate(test_loader):
         lr_l = batch["lr_left"].to(device)
@@ -82,12 +94,6 @@ def test(args):
 
         sr_l = output.sr_left.clamp(0, 1)
         sr_r = output.sr_right.clamp(0, 1)
-
-        if tlsc is not None:
-            lr_up_l = F.interpolate(lr_l, scale_factor=args.scale, mode="bicubic", align_corners=False)
-            lr_up_r = F.interpolate(lr_r, scale_factor=args.scale, mode="bicubic", align_corners=False)
-            sr_l = tlsc(sr_l, lr_up_l)
-            sr_r = tlsc(sr_r, lr_up_r)
 
         min_h = min(sr_l.shape[2], hr_l.shape[2])
         min_w = min(sr_l.shape[3], hr_l.shape[3])
