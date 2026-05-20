@@ -54,12 +54,22 @@ class SpectralStereoBlock(nn.Module):
         ffn_expansion: float = 2.0,
         use_scam: bool = True,
         use_cvsfm: bool = True,
+        cvsfm_use_gate: bool = True,
+        cvsfm_use_1d_fft: bool = False,
     ):
         super().__init__()
         # Shared per-view spatial processor (single weight set for both L and R).
         self.naf = NAFBlock(channels, dw_expansion, ffn_expansion)
         self.scam = StereoCrossAttention(channels) if use_scam else None
-        self.cvsfm = CrossViewSpectralFusion(channels) if use_cvsfm else None
+        self.cvsfm = (
+            CrossViewSpectralFusion(
+                channels,
+                use_gate=cvsfm_use_gate,
+                use_1d_fft=cvsfm_use_1d_fft,
+            )
+            if use_cvsfm
+            else None
+        )
 
     def forward(self, x_l: torch.Tensor, x_r: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         # Per-view spatial processing (shared weights).
@@ -87,6 +97,8 @@ class StereoSRV6(nn.Module):
         ffn_expansion: float = 2.0,
         use_scam: bool = True,
         use_cvsfm: bool = True,
+        cvsfm_use_gate: bool = True,
+        cvsfm_use_1d_fft: bool = False,
     ):
         super().__init__()
         if scale not in (2, 3, 4):
@@ -104,6 +116,8 @@ class StereoSRV6(nn.Module):
                 ffn_expansion=ffn_expansion,
                 use_scam=use_scam,
                 use_cvsfm=use_cvsfm,
+                cvsfm_use_gate=cvsfm_use_gate,
+                cvsfm_use_1d_fft=cvsfm_use_1d_fft,
             )
             for _ in range(num_blocks)
         ])

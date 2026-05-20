@@ -24,6 +24,8 @@ def build_model_v6(args: argparse.Namespace) -> StereoSRV6:
         ffn_expansion=args.ffn_expansion,
         use_scam=not args.no_scam,
         use_cvsfm=not args.no_cvsfm,
+        cvsfm_use_gate=not getattr(args, "cvsfm_no_gate", False),
+        cvsfm_use_1d_fft=getattr(args, "cvsfm_1d_fft", False),
     )
 
 

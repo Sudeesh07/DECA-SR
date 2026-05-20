@@ -26,6 +26,15 @@ def _add_common_args(parser: argparse.ArgumentParser) -> None:
                         help="Disable spatial cross-view attention (ablation).")
     parser.add_argument("--no_cvsfm", action="store_true", default=False,
                         help="Disable spectral cross-view fusion (ablation).")
+    parser.add_argument("--cvsfm_no_gate", action="store_true", default=False,
+                        help="Ablation A6: disable CVSFM's learnable per-frequency "
+                             "gate; fuse magnitudes as a simple α=0.5 average. "
+                             "Tests whether learnable mixing (gate) or magnitude "
+                             "invariance is what the spectral path exploits.")
+    parser.add_argument("--cvsfm_1d_fft", action="store_true", default=False,
+                        help="Ablation A5: use 1D rfft along the width axis only "
+                             "in CVSFM (disparity is purely horizontal, so the "
+                             "shift theorem invoked by Proposition 1 is 1D).")
 
     # Data
     parser.add_argument("--data_root", type=str, default="datasets/StereoSR")
