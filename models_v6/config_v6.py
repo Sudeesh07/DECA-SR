@@ -35,6 +35,13 @@ def _add_common_args(parser: argparse.ArgumentParser) -> None:
                         help="Ablation A5: use 1D rfft along the width axis only "
                              "in CVSFM (disparity is purely horizontal, so the "
                              "shift theorem invoked by Proposition 1 is 1D).")
+    parser.add_argument("--cvsfm_v2", action="store_true", default=False,
+                        help="Use the theoretically-revised CVSFM v2: 1D rfft, "
+                             "log-magnitude additive residual (generative, not "
+                             "convex-combination bounded), and per-pixel image-"
+                             "domain spatial gate (localised occlusion handling). "
+                             "Drops v1's strict magnitude-invariance claim. "
+                             "Overrides --cvsfm_no_gate and --cvsfm_1d_fft.")
 
     # Data
     parser.add_argument("--data_root", type=str, default="datasets/StereoSR")

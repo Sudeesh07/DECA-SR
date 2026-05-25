@@ -34,7 +34,7 @@ import torch.nn.functional as F
 
 from .blocks import LayerNorm2d, NAFBlock, TailUpsample
 from .epipolar_attention import StereoCrossAttention
-from .spectral_fusion import CrossViewSpectralFusion
+from .spectral_fusion import CrossViewSpectralFusion, CrossViewSpectralFusionV2
 
 
 @dataclass
@@ -56,20 +56,26 @@ class SpectralStereoBlock(nn.Module):
         use_cvsfm: bool = True,
         cvsfm_use_gate: bool = True,
         cvsfm_use_1d_fft: bool = False,
+        cvsfm_version: str = "v1",
     ):
         super().__init__()
+        if cvsfm_version not in ("v1", "v2"):
+            raise ValueError(f"cvsfm_version must be 'v1' or 'v2' (got {cvsfm_version!r})")
         # Shared per-view spatial processor (single weight set for both L and R).
         self.naf = NAFBlock(channels, dw_expansion, ffn_expansion)
         self.scam = StereoCrossAttention(channels) if use_scam else None
-        self.cvsfm = (
-            CrossViewSpectralFusion(
+        if not use_cvsfm:
+            self.cvsfm = None
+        elif cvsfm_version == "v2":
+            # v2 ignores use_gate/use_1d_fft (it is 1D by construction and uses
+            # a spatial gate, not a per-frequency one).
+            self.cvsfm = CrossViewSpectralFusionV2(channels)
+        else:
+            self.cvsfm = CrossViewSpectralFusion(
                 channels,
                 use_gate=cvsfm_use_gate,
                 use_1d_fft=cvsfm_use_1d_fft,
             )
-            if use_cvsfm
-            else None
-        )
 
     def forward(self, x_l: torch.Tensor, x_r: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         # Per-view spatial processing (shared weights).
@@ -99,6 +105,7 @@ class StereoSRV6(nn.Module):
         use_cvsfm: bool = True,
         cvsfm_use_gate: bool = True,
         cvsfm_use_1d_fft: bool = False,
+        cvsfm_version: str = "v1",
     ):
         super().__init__()
         if scale not in (2, 3, 4):
@@ -118,6 +125,7 @@ class StereoSRV6(nn.Module):
                 use_cvsfm=use_cvsfm,
                 cvsfm_use_gate=cvsfm_use_gate,
                 cvsfm_use_1d_fft=cvsfm_use_1d_fft,
+                cvsfm_version=cvsfm_version,
             )
             for _ in range(num_blocks)
         ])
