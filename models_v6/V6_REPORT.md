@@ -412,7 +412,40 @@ Docker containers default to **64 MB /dev/shm**, too small for DataLoader IPC wi
 
 Runs on rank 0 only every `val_interval` (default 2500). Gating condition must be identical on every rank so all ranks reach the post-val barrier together — earlier bug caused rank 1 (where `val_loader = None`) to skip the barrier and deadlock the next collective. Fixed at [train_ddp_v6.py:447-467](models_v6/train_ddp_v6.py#L447-L467).
 
-### 4.8 Checkpointing
+### 4.8 CVSFM diagnostics — silent-collapse health check
+
+Spectral modules can silently collapse to identity: γ stuck near zero, sgate clamped shut, training loss drops normally because the per-view NAFBlock is doing its own work, and you don't realise CVSFM contributed nothing until iter 100k. The diagnostics here detect this in the first few thousand iterations so a doomed run can be killed early.
+
+**Mechanism**: CVSFM v2 and v3 store a small set of summary tensors as Python attributes (NOT buffers — DDP doesn't sync them, they don't end up in checkpoints) under `no_grad` during the forward pass:
+
+- `_diag_sgate_l`, `_diag_sgate_r` — mean of the per-pixel spatial gate (v2 + v3)
+- `_diag_gain_dev` — mean of `|gain − 1|` (v3 only, the filter magnitude deviation from identity)
+- `_diag_theta_abs` — mean of `|θ|` (v3 only, the filter phase deviation from identity)
+
+In addition, `γ_L`, `γ_R` are read directly off the parameter (parameter abs-mean per block, no extra cost).
+
+`gather_cvsfm_diagnostics(model)` walks the trunk and returns one dict per block. `log_diagnostics(diags, ...)` emits a one-line summary every `--log_interval` iterations and writes per-block scalars to TensorBoard under `diag/blockNN/{gamma_l, gamma_r, sgate_l, sgate_r, gain_dev, theta_abs}` plus summary scalars under `diag/summary/`.
+
+**Silent-collapse warning**: if `iteration ≥ 5000` (configurable) and the maximum block-mean `|γ|` across all blocks is `< 1e-3`, a `[SILENT-COLLAPSE WARNING]` is logged. With normal training dynamics γ lifts off zero within a few hundred iterations (smoke test: γ mean = 3.2e-02 after 5 large-LR steps). If γ is still at 0.0 at iter 5000, the spectral path is functionally dead and the run can be aborted.
+
+**Sample expected log line** (every `--log_interval`, after the loss line):
+```
+diag γ: min=4.3e-02 max=7.1e-02 mean=5.8e-02 | sgate: min=0.45 max=0.62 mean=0.53 | |gain−1|: max=0.041 mean=0.018 | |θ|: max=0.93 mean=0.38
+```
+
+What "healthy" looks like at, say, iter 10000:
+- `γ` somewhere in 1e-2 to 1e-1 (lifted off zero, not yet saturated)
+- `sgate` somewhere in 0.3 to 0.7 (gate is *doing* something locally)
+- `|gain − 1|` and `|θ|` both clearly nonzero (filter is moving away from `A = 1`)
+
+What "collapse" looks like:
+- `γ` still at `< 1e-3` past iter 5000 — the warning fires
+- OR `sgate` clamped at < 0.05 globally — the spatial gate has decided "never inject the warp"
+- OR `|gain − 1| ≈ 0` and `|θ| ≈ 0` past warmup — the alignment net is stuck at identity
+
+Implementation: [train_ddp_v6.py:172-272](models_v6/train_ddp_v6.py#L172-L272) (helpers); [spectral_fusion.py](models_v6/spectral_fusion.py) v2 forward at L266+, v3 forward at L321+ (capture sites).
+
+### 4.9 Checkpointing
 
 - **Best**: saved on every val improvement at `checkpoints/best.pth`.
 - **Periodic**: every `save_interval` (default 5000) at `checkpoints/iter_{N}.pth`. Pruned to the most recent `keep_ckpts` (default 5).
@@ -685,7 +718,7 @@ External dependencies:
 5. **Gain bound sensitivity**: `--cvsfm_v3_gain_scale ∈ {0.05, 0.1, 0.3, 0.5}` — how restrictive must |A| be to stay stable, and at what point does the bound start limiting useful expressiveness?
 6. **Curriculum effect**: does pretraining v3-only then adding SCAM beat training the combined model from scratch?
 7. **Phase-correlation auxiliary loss**: should we replace the disabled `SpectralConsistencyLoss` with a v3-consistent term (e.g. encourage `|cross_power|` to be peaked rather than diffuse)? Out of scope until v3 architectural results are in.
-8. **Visualisation tooling**: spectral modules can silently collapse to identity (γ stuck near zero) without observable training-loss signature. A `--log_v3_diagnostics` flag exposing γ magnitudes, sgate activity, and filter `|A|` deviation per block would catch this. Not yet implemented.
+8. **~~Visualisation tooling~~** — **implemented** in §4.8. `gather_cvsfm_diagnostics` + `log_diagnostics` expose γ, sgate, and filter |gain−1|/|θ| per block every `--log_interval`; silent-collapse warning fires at iter ≥ 5000 if γ has not lifted off zero. The first ~5000 iters of any v2/v3 run will now show whether the spectral path is alive *before* committing to the full 100k.
 9. **Engineering bundle** (independent of architecture): EMA + AdamW(0.9, 0.9) + larger patches + self-ensemble. Expected: +0.15 to +0.30 dB on top of whichever architecture wins.
 10. **Model-size scaling**: V6 small is 1.4–2.1 M params. NAFSSR-L is 24 M at ~24.2 dB. The path to >24 dB likely runs through capacity at least as much as through architecture.
 

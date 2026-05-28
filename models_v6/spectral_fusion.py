@@ -263,6 +263,10 @@ class CrossViewSpectralFusionV2(nn.Module):
         self.gamma_l = nn.Parameter(torch.zeros(1, channels, 1, 1))
         self.gamma_r = nn.Parameter(torch.zeros(1, channels, 1, 1))
 
+        # Diagnostic captures for silent-collapse detection.
+        self._diag_sgate_l: torch.Tensor | None = None
+        self._diag_sgate_r: torch.Tensor | None = None
+
     def forward(self, x_l: torch.Tensor, x_r: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         B, C, H, W = x_l.shape
         dtype = x_l.dtype
@@ -311,6 +315,10 @@ class CrossViewSpectralFusionV2(nn.Module):
         # Image-domain spatial gate (per-pixel localisation of the residual).
         sgate_l = torch.sigmoid(self.sgate_l(torch.cat([x_l, x_r], dim=1)))
         sgate_r = torch.sigmoid(self.sgate_r(torch.cat([x_r, x_l], dim=1)))
+
+        with torch.no_grad():
+            self._diag_sgate_l = sgate_l.mean().detach()
+            self._diag_sgate_r = sgate_r.mean().detach()
 
         # Two-level residual: per-channel γ × per-pixel sgate × spectral diff.
         out_l = x_l + self.gamma_l * sgate_l * (xl_new - x_l)
@@ -446,6 +454,15 @@ class CrossViewSpectralFusionV3(nn.Module):
         self.gamma_l = nn.Parameter(torch.zeros(1, channels, 1, 1))
         self.gamma_r = nn.Parameter(torch.zeros(1, channels, 1, 1))
 
+        # Diagnostic captures — Python attributes (NOT buffers) so DDP doesn't
+        # try to sync them across ranks and they don't end up in checkpoints.
+        # Updated under no_grad in the forward; consumed by train_ddp_v6's
+        # gather_diagnostics() helper. None until the first forward.
+        self._diag_sgate_l: torch.Tensor | None = None
+        self._diag_sgate_r: torch.Tensor | None = None
+        self._diag_gain_dev: torch.Tensor | None = None   # mean |gain − 1|
+        self._diag_theta_abs: torch.Tensor | None = None  # mean |theta|
+
     # ------------------------------------------------------------------
     # STFT / iSTFT with Hann window + 50 % overlap-add (WOLA).
     # ------------------------------------------------------------------
@@ -519,12 +536,14 @@ class CrossViewSpectralFusionV3(nn.Module):
     # Bounded complex filter from raw 2C output.
     # ------------------------------------------------------------------
 
-    def _filter(self, raw: torch.Tensor, freq: torch.Tensor) -> torch.Tensor:
+    def _filter(self, raw: torch.Tensor, freq: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Build bounded complex filter from raw (g_raw, theta_raw).
 
         ``raw`` shape: [B, 2C, S, Wf] where S = spatial collapsed dim.
         ``freq`` shape: [B, 1, S, Wf] in [0, 0.5].
-        Returns complex filter [B, C, S, Wf].
+        Returns ``(A, gain_dev, theta)`` where ``A`` is the complex filter
+        [B, C, S, Wf]. ``gain_dev`` and ``theta`` are the (real) deviation
+        from identity, returned so the forward can record diagnostics.
         """
         g_raw, theta_raw = raw.chunk(2, dim=1)
         gain_dev = self.gain_scale * torch.tanh(g_raw)
@@ -536,7 +555,8 @@ class CrossViewSpectralFusionV3(nn.Module):
             gain_dev = gain_dev * hf
             theta = theta * hf
         gain = 1.0 + gain_dev
-        return torch.complex(gain * theta.cos(), gain * theta.sin())
+        A = torch.complex(gain * theta.cos(), gain * theta.sin())
+        return A, gain_dev, theta
 
     # ------------------------------------------------------------------
     # Forward.
@@ -585,10 +605,15 @@ class CrossViewSpectralFusionV3(nn.Module):
 
             # Predict raw filter params for each direction.
             cond_l = torch.cat([cos_dphi, sin_dphi, log_mag_l, log_mag_r, freq], dim=1)
-            A_l = self._filter(self.align_l(cond_l), freq)
+            A_l, gain_dev_l, theta_l = self._filter(self.align_l(cond_l), freq)
 
             cond_r = torch.cat([cos_dphi, -sin_dphi, log_mag_r, log_mag_l, freq], dim=1)
-            A_r = self._filter(self.align_r(cond_r), freq)
+            A_r, gain_dev_r, theta_r = self._filter(self.align_r(cond_r), freq)
+
+            # Diagnostic captures (no_grad — for the silent-collapse health check).
+            with torch.no_grad():
+                self._diag_gain_dev = 0.5 * (gain_dev_l.abs().mean() + gain_dev_r.abs().mean())
+                self._diag_theta_abs = 0.5 * (theta_l.abs().mean() + theta_r.abs().mean())
 
             # Warp other view onto self in the spectral domain.
             F_r_to_l_c = F_r_c * A_l
@@ -610,6 +635,10 @@ class CrossViewSpectralFusionV3(nn.Module):
         # Spatial gate: per-pixel confidence that the warp is reliable.
         sgate_l = torch.sigmoid(self.sgate_l(torch.cat([x_l, x_r_to_l], dim=1)))
         sgate_r = torch.sigmoid(self.sgate_r(torch.cat([x_r, x_l_to_r], dim=1)))
+
+        with torch.no_grad():
+            self._diag_sgate_l = sgate_l.mean().detach()
+            self._diag_sgate_r = sgate_r.mean().detach()
 
         out_l = x_l + self.gamma_l * sgate_l * (x_r_to_l - x_l)
         out_r = x_r + self.gamma_r * sgate_r * (x_l_to_r - x_r)

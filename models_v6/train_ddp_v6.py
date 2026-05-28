@@ -167,6 +167,110 @@ def build_train_loader(args, rank: int, world_size: int):
 
 
 # ---------------------------------------------------------------------------
+# Diagnostics — silent-collapse health check for CVSFM v2/v3
+# ---------------------------------------------------------------------------
+
+def gather_cvsfm_diagnostics(model: nn.Module) -> list[dict]:
+    """Walk the trunk and read each CVSFM block's diagnostic captures.
+
+    Returns one dict per block-with-CVSFM, containing per-block γ magnitudes,
+    sgate activity, and (v3 only) filter gain/phase deviation from identity.
+    Empty list if no block has a CVSFM module (e.g. SCAM-only configs).
+
+    Cheap: only reads pre-computed tensors stored as Python attributes on the
+    module. Does NOT trigger an extra forward pass.
+    """
+    raw_model = model.module if hasattr(model, "module") else model
+    out: list[dict] = []
+    for index, block in enumerate(raw_model.trunk):
+        cv = getattr(block, "cvsfm", None)
+        if cv is None:
+            continue
+        d: dict = {"block": index}
+        # γ — parameter, always available.
+        d["gamma_l"] = cv.gamma_l.data.abs().mean().item()
+        d["gamma_r"] = cv.gamma_r.data.abs().mean().item()
+        # sgate — None until the first forward. v2 and v3 both have it.
+        sgl = getattr(cv, "_diag_sgate_l", None)
+        sgr = getattr(cv, "_diag_sgate_r", None)
+        if sgl is not None:
+            d["sgate_l"] = sgl.item()
+            d["sgate_r"] = sgr.item()
+        # v3-only: filter deviation from identity.
+        gd = getattr(cv, "_diag_gain_dev", None)
+        th = getattr(cv, "_diag_theta_abs", None)
+        if gd is not None:
+            d["gain_dev"] = gd.item()
+            d["theta_abs"] = th.item()
+        out.append(d)
+    return out
+
+
+def log_diagnostics(
+    diags: list[dict],
+    iteration: int,
+    logger,
+    writer,
+    health_warn_threshold: float = 1e-3,
+    health_warn_after_iter: int = 5000,
+):
+    """Log per-block summary stats and warn if v3 is silently collapsing.
+
+    The health check: if iteration > ``health_warn_after_iter`` and every
+    block's mean |γ| is below ``health_warn_threshold``, the spectral path
+    is functionally inert — emit a loud WARNING so the user can kill the
+    run early instead of waiting 100k iters to discover v3 did nothing.
+    """
+    if not diags:
+        return
+    gammas = [0.5 * (d["gamma_l"] + d["gamma_r"]) for d in diags]
+    sgates = [0.5 * (d["sgate_l"] + d["sgate_r"]) for d in diags if "sgate_l" in d]
+    gain_devs = [d["gain_dev"] for d in diags if "gain_dev" in d]
+    theta_abs = [d["theta_abs"] for d in diags if "theta_abs" in d]
+
+    parts = [
+        f"diag γ: min={min(gammas):.2e} max={max(gammas):.2e} mean={sum(gammas)/len(gammas):.2e}"
+    ]
+    if sgates:
+        parts.append(
+            f"sgate: min={min(sgates):.3f} max={max(sgates):.3f} mean={sum(sgates)/len(sgates):.3f}"
+        )
+    if gain_devs:
+        parts.append(
+            f"|gain−1|: max={max(gain_devs):.4f} mean={sum(gain_devs)/len(gain_devs):.4f}"
+        )
+    if theta_abs:
+        parts.append(
+            f"|θ|: max={max(theta_abs):.4f} mean={sum(theta_abs)/len(theta_abs):.4f}"
+        )
+    logger.info("  " + " | ".join(parts))
+
+    # TensorBoard: per-block scalars under diag/.
+    if writer is not None:
+        for d in diags:
+            blk = d["block"]
+            for key in ("gamma_l", "gamma_r", "sgate_l", "sgate_r", "gain_dev", "theta_abs"):
+                if key in d:
+                    writer.add_scalar(f"diag/block{blk:02d}/{key}", d[key], iteration)
+        # Summary scalars (easier to glance at).
+        writer.add_scalar("diag/summary/gamma_mean", sum(gammas) / len(gammas), iteration)
+        writer.add_scalar("diag/summary/gamma_max", max(gammas), iteration)
+        if sgates:
+            writer.add_scalar("diag/summary/sgate_mean", sum(sgates) / len(sgates), iteration)
+        if gain_devs:
+            writer.add_scalar("diag/summary/gain_dev_max", max(gain_devs), iteration)
+
+    # Silent-collapse warning.
+    if iteration >= health_warn_after_iter and max(gammas) < health_warn_threshold:
+        logger.warning(
+            f"  [SILENT-COLLAPSE WARNING] iter {iteration}: max block-mean |γ| "
+            f"= {max(gammas):.2e} < {health_warn_threshold:.0e}. "
+            f"The CVSFM spectral path is functionally inert — γ has not lifted "
+            f"off zero in any block. Consider killing this run."
+        )
+
+
+# ---------------------------------------------------------------------------
 # Validation (rank 0 only)
 # ---------------------------------------------------------------------------
 
@@ -440,6 +544,12 @@ def train(args):
                 for key, value in loss_dict.items():
                     if isinstance(value, torch.Tensor):
                         writer.add_scalar(f"train/{key}", value.item(), iteration)
+
+            # CVSFM diagnostics — silent-collapse health check. No-op for
+            # SCAM-only configs (no cvsfm modules in the trunk).
+            diags = gather_cvsfm_diagnostics(model)
+            if diags:
+                log_diagnostics(diags, iteration, logger, writer)
 
             psnr_meter.reset()
             ssim_meter.reset()
