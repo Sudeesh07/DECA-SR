@@ -42,6 +42,35 @@ def _add_common_args(parser: argparse.ArgumentParser) -> None:
                              "domain spatial gate (localised occlusion handling). "
                              "Drops v1's strict magnitude-invariance claim. "
                              "Overrides --cvsfm_no_gate and --cvsfm_1d_fft.")
+    parser.add_argument("--cvsfm_v3", action="store_true", default=False,
+                        help="Use CVSFM v3: phase-correlation cross-view alignment. "
+                             "Operates on inter-view phase difference (the actual "
+                             "stereo signature under the shift theorem) rather than "
+                             "magnitudes (which are nearly equal between views and "
+                             "carry no cross-view info). Predicts a complex alignment "
+                             "filter from normalised cross-power. Recommended path. "
+                             "Overrides --cvsfm_v2/--cvsfm_no_gate/--cvsfm_1d_fft.")
+    parser.add_argument("--cvsfm_v3_window", type=int, default=0,
+                        help="Window size for v3's 1D STFT along width. 0 (default) "
+                             "uses full-row FFT. Setting e.g. 30 splits each row "
+                             "into Hann-windowed frames with 50%% overlap-add (WOLA) "
+                             "reconstruction — locally-constant disparity, analogue "
+                             "of local attention.")
+    parser.add_argument("--cvsfm_v3_hf_only", action="store_true", default=False,
+                        help="Restrict v3's filter deviation from identity to mid/"
+                             "high frequencies (linear ramp). DC and very low "
+                             "frequencies are forced to A=1 (no change). Useful "
+                             "when low-frequency structure should come from the "
+                             "bicubic residual and per-view processing.")
+    parser.add_argument("--cvsfm_v3_gain_scale", type=float, default=0.1,
+                        help="Bound on v3's magnitude gain: |gain - 1| <= "
+                             "cvsfm_v3_gain_scale. Default 0.1 → gain in [0.9, 1.1]. "
+                             "Phase is always bounded in (-pi, pi).")
+    parser.add_argument("--cvsfm_first", action="store_true", default=False,
+                        help="Swap block ordering so CVSFM runs BEFORE SCAM "
+                             "(default is NAFBlock → SCAM → CVSFM). Use this when "
+                             "CVSFM v3 is intended as the primary cross-view "
+                             "module and SCAM as a refinement step.")
 
     # Data
     parser.add_argument("--data_root", type=str, default="datasets/StereoSR")
@@ -73,7 +102,14 @@ def _add_common_args(parser: argparse.ArgumentParser) -> None:
     # Losses
     parser.add_argument("--charbonnier_eps", type=float, default=1e-3)
     parser.add_argument("--stereo_weight", type=float, default=0.02)
-    parser.add_argument("--spectral_weight", type=float, default=0.01)
+    parser.add_argument("--spectral_weight", type=float, default=0.0,
+                        help="Weight on L1(|F(SR_L)|, |F(SR_R)|) — derived from "
+                             "v1's strict magnitude-invariance theorem (now "
+                             "falsified by ablation A6). Disabled by default; "
+                             "the loss penalises exactly the magnitude differences "
+                             "that real occlusion and photometric mismatch produce, "
+                             "and the architecture (CVSFM v2/v3) already handles "
+                             "the spectral information channel internally.")
     parser.add_argument("--stereo_max_shift", type=int, default=48)
 
     # Logging

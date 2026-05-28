@@ -34,7 +34,11 @@ import torch.nn.functional as F
 
 from .blocks import LayerNorm2d, NAFBlock, TailUpsample
 from .epipolar_attention import StereoCrossAttention
-from .spectral_fusion import CrossViewSpectralFusion, CrossViewSpectralFusionV2
+from .spectral_fusion import (
+    CrossViewSpectralFusion,
+    CrossViewSpectralFusionV2,
+    CrossViewSpectralFusionV3,
+)
 
 
 @dataclass
@@ -57,15 +61,27 @@ class SpectralStereoBlock(nn.Module):
         cvsfm_use_gate: bool = True,
         cvsfm_use_1d_fft: bool = False,
         cvsfm_version: str = "v1",
+        cvsfm_v3_window: int = 0,
+        cvsfm_v3_hf_only: bool = False,
+        cvsfm_v3_gain_scale: float = 0.1,
+        cvsfm_first: bool = False,
     ):
         super().__init__()
-        if cvsfm_version not in ("v1", "v2"):
-            raise ValueError(f"cvsfm_version must be 'v1' or 'v2' (got {cvsfm_version!r})")
+        if cvsfm_version not in ("v1", "v2", "v3"):
+            raise ValueError(f"cvsfm_version must be 'v1', 'v2', or 'v3' (got {cvsfm_version!r})")
+        self.cvsfm_first = cvsfm_first
         # Shared per-view spatial processor (single weight set for both L and R).
         self.naf = NAFBlock(channels, dw_expansion, ffn_expansion)
         self.scam = StereoCrossAttention(channels) if use_scam else None
         if not use_cvsfm:
             self.cvsfm = None
+        elif cvsfm_version == "v3":
+            self.cvsfm = CrossViewSpectralFusionV3(
+                channels,
+                window=cvsfm_v3_window,
+                hf_only=cvsfm_v3_hf_only,
+                gain_scale=cvsfm_v3_gain_scale,
+            )
         elif cvsfm_version == "v2":
             # v2 ignores use_gate/use_1d_fft (it is 1D by construction and uses
             # a spatial gate, not a per-frequency one).
@@ -81,12 +97,20 @@ class SpectralStereoBlock(nn.Module):
         # Per-view spatial processing (shared weights).
         x_l = self.naf(x_l)
         x_r = self.naf(x_r)
-        # Spatial cross-view fusion (epipolar attention).
-        if self.scam is not None:
-            x_l, x_r = self.scam(x_l, x_r)
-        # Spectral cross-view fusion (magnitude fusion, phase preservation).
-        if self.cvsfm is not None:
-            x_l, x_r = self.cvsfm(x_l, x_r)
+        # Spectral-first ordering puts CVSFM (v3 = phase-correlation alignment)
+        # before SCAM, demoting SCAM to a refinement / fallback step. Use this
+        # when CVSFM v3 is intended as the primary cross-view module. Default
+        # ordering (SCAM → CVSFM) is preserved for v1/v2 ablations.
+        if self.cvsfm_first:
+            if self.cvsfm is not None:
+                x_l, x_r = self.cvsfm(x_l, x_r)
+            if self.scam is not None:
+                x_l, x_r = self.scam(x_l, x_r)
+        else:
+            if self.scam is not None:
+                x_l, x_r = self.scam(x_l, x_r)
+            if self.cvsfm is not None:
+                x_l, x_r = self.cvsfm(x_l, x_r)
         return x_l, x_r
 
 
@@ -106,6 +130,10 @@ class StereoSRV6(nn.Module):
         cvsfm_use_gate: bool = True,
         cvsfm_use_1d_fft: bool = False,
         cvsfm_version: str = "v1",
+        cvsfm_v3_window: int = 0,
+        cvsfm_v3_hf_only: bool = False,
+        cvsfm_v3_gain_scale: float = 0.1,
+        cvsfm_first: bool = False,
     ):
         super().__init__()
         if scale not in (2, 3, 4):
@@ -126,6 +154,10 @@ class StereoSRV6(nn.Module):
                 cvsfm_use_gate=cvsfm_use_gate,
                 cvsfm_use_1d_fft=cvsfm_use_1d_fft,
                 cvsfm_version=cvsfm_version,
+                cvsfm_v3_window=cvsfm_v3_window,
+                cvsfm_v3_hf_only=cvsfm_v3_hf_only,
+                cvsfm_v3_gain_scale=cvsfm_v3_gain_scale,
+                cvsfm_first=cvsfm_first,
             )
             for _ in range(num_blocks)
         ])

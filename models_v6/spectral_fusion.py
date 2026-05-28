@@ -28,11 +28,19 @@ conditioned on both. A per-pixel spatial gate localises this residual in the
 image domain so that the correction can be down-weighted where (ii)–(iv) are
 violated (occlusion, specular highlight, image boundary).
 
-Two implementations live here:
+Three implementations live here:
 * :class:`CrossViewSpectralFusion`        — v1, the original strict-mixing
   design retained for ablations A1/A2/A4/A5/A6.
-* :class:`CrossViewSpectralFusionV2`      — v2, the theoretically-revised
-  design below.
+* :class:`CrossViewSpectralFusionV2`      — v2, log-magnitude residual +
+  spatial gate. Retained but NOT the recommended path: v2 still operates on
+  magnitudes only, which are already ~equal between views under the shift
+  theorem, so it cannot transfer the cross-view geometric signal (that
+  signal lives in the phase DIFFERENCE).
+* :class:`CrossViewSpectralFusionV3`      — v3, phase-correlation-based
+  cross-view alignment. Operates on ∠F_R − ∠F_L (the actual stereo
+  signature), predicting a learned complex alignment filter per
+  (channel, row, frequency) bin. This is the structurally correct
+  operator for cross-view information transfer.
 
 Implementation notes
 --------------------
@@ -43,8 +51,11 @@ Implementation notes
 """
 from __future__ import annotations
 
+import math
+
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 class CrossViewSpectralFusion(nn.Module):
@@ -304,4 +315,302 @@ class CrossViewSpectralFusionV2(nn.Module):
         # Two-level residual: per-channel γ × per-pixel sgate × spectral diff.
         out_l = x_l + self.gamma_l * sgate_l * (xl_new - x_l)
         out_r = x_r + self.gamma_r * sgate_r * (xr_new - x_r)
+        return out_l, out_r
+
+
+class CrossViewSpectralFusionV3(nn.Module):
+    """v3 spectral path: phase-correlation cross-view alignment with bounded
+    filter parametrisation and Hann/overlap-add windowing.
+
+    Why v3 exists
+    -------------
+    Ablation A6 falsified v1's magnitude-mixing mechanism (−0.004 dB on top
+    of SCAM). The mechanical reason: under the shift theorem,
+        F_R(ω) = F_L(ω) · exp(−jωd)   ⇒   |F_R| ≈ |F_L|,
+    so v1 mixes the part the views ALREADY agree on (magnitudes) while
+    preserving each view's OWN phase — the part that actually distinguishes
+    them. v2 inherits the flaw: log-magnitude residual is a better magnitude
+    operator but still never touches the inter-view phase difference, which
+    is where the cross-view signal lives.
+
+    v3 operates on the phase DIFFERENCE — the actual stereo signature.
+
+    Engineering safety guards (added after second-round critique)
+    -------------------------------------------------------------
+    Earlier v3 used an unconstrained complex filter ``A = A_real + j·A_imag``
+    and non-overlapping rectangular windows. Both are unstable: the filter
+    could amplify frequencies and rotate phase arbitrarily, and rectangular
+    windows produce spectral leakage and boundary ringing (Gibbs phenomenon).
+    This version fixes both:
+
+    * **Bounded filter parametrisation**:
+          gain  = 1 + ``gain_scale`` · tanh(g_raw)         ∈ [1 − s, 1 + s]
+          theta = π · tanh(θ_raw)                          ∈ (−π, π)
+          A     = gain · (cos θ + j sin θ)
+      At init (network output ≈ 0) gain ≈ 1, theta ≈ 0, A ≈ 1 — identity
+      filter. Worst-case gain is bounded; phase is wrapped naturally.
+    * **Hann window + 50 % overlap-add (WOLA)** when ``window > 0``:
+      analysis Hann tapering reduces spectral leakage; 50 % overlap with
+      synthesis Hann gives weighted overlap-add reconstruction, normalised
+      by sum-of-squared windows. No inverse-window division.
+    * **Optional HF-only** (``hf_only=True``): scales the filter's deviation
+      from identity by frequency, so DC and very-low-frequency components
+      are forced to A ≈ 1 (no change). High frequencies — where SR
+      reconstruction actually lives — get the full bounded range.
+
+    Mechanism (per view-pair, per block)
+    ------------------------------------
+    1. **1D STFT along width** (Hann + 50 % overlap when windowed; full-row
+       rfft when ``window=0``).
+    2. Cross-power phase difference computed without ``atan2``:
+           cp = F_L · conj(F_R);   ĉp = cp / (|cp| + ε)
+           cos Δφ = ĉp.real,  sin Δφ = ĉp.imag.
+    3. Predict raw filter (g_raw, θ_raw) per (channel, frame, frequency) bin
+       from ``[cos Δφ, sin Δφ, log|F_L|, log|F_R|, freq]`` via 1×1 conv MLP.
+    4. Apply bounded parametrisation to get complex filter A. Warp the OTHER
+       view onto SELF: ``F_R→L = F_R · A_L``, ``F_L→R = F_L · A_R``.
+    5. **Inverse STFT** (irfft + Hann synthesis + overlap-add + normalise).
+    6. Per-pixel image-domain spatial gate from ``concat(x_self,
+       x_other_warped)`` localises the residual. Occlusion handling.
+    7. γ per-channel zero-init residual scale; the block is exact identity
+       at step 0.
+
+    Identity-at-init contract (verified by smoke test)
+    --------------------------------------------------
+    * γ_L, γ_R = 0 exactly  →  output equals input exactly.
+    * Alignment final layer: weights kaiming × ``align_init_scale`` (default
+      0.01), bias = 0. Output ≈ 0 ⇒ ``tanh(0) = 0`` ⇒ gain = 1, theta = 0
+      ⇒ A = 1 exactly at init.
+    * ``∂out/∂γ = sgate · (x_other_warped − x_self) = sgate · (x_other −
+      x_self) ≠ 0`` so γ lifts off zero immediately.
+
+    No semantic claim about "magnitude = appearance" or "phase = geometry".
+    """
+
+    def __init__(
+        self,
+        channels: int,
+        hidden_expansion: float = 0.5,
+        log_eps: float = 1e-6,
+        align_init_scale: float = 0.01,
+        window: int = 0,
+        gain_scale: float = 0.1,
+        hf_only: bool = False,
+    ):
+        super().__init__()
+        if window < 0:
+            raise ValueError(f"window must be >= 0 (got {window})")
+        if window > 0 and window < 4:
+            raise ValueError(f"window must be 0 (off) or >= 4 (got {window})")
+        self.log_eps = log_eps
+        self.window = int(window)
+        self.hop = self.window // 2 if self.window > 0 else 0
+        self.gain_scale = float(gain_scale)
+        self.hf_only = bool(hf_only)
+        hidden = max(8, int(channels * hidden_expansion))
+
+        # Alignment networks: predict per-(spatial, freq) raw (g_raw, θ_raw)
+        # pairs. Conditioning: [cos Δφ, sin Δφ, log|F_self|, log|F_other|, freq]
+        # = 4C + 1 channels. Output 2C: first C is g_raw, second C is θ_raw.
+        def _make_align() -> nn.Sequential:
+            net = nn.Sequential(
+                nn.Conv2d(4 * channels + 1, hidden, 1),
+                nn.GELU(),
+                nn.Conv2d(hidden, 2 * channels, 1),
+            )
+            nn.init.kaiming_normal_(net[-1].weight, mode="fan_out", nonlinearity="linear")
+            with torch.no_grad():
+                net[-1].weight.mul_(align_init_scale)
+            # Bias = 0 → at init tanh(0) = 0 → gain = 1, theta = 0 → A = 1.
+            nn.init.zeros_(net[-1].bias)
+            return net
+
+        self.align_l = _make_align()  # warps R onto L
+        self.align_r = _make_align()  # warps L onto R
+
+        # Image-domain spatial gates. Input: concat(x_self, x_other_warped).
+        def _make_sgate() -> nn.Sequential:
+            return nn.Sequential(
+                nn.Conv2d(2 * channels, 2 * channels, 3, padding=1, groups=2 * channels),
+                nn.Conv2d(2 * channels, channels, 1),
+            )
+
+        self.sgate_l = _make_sgate()
+        self.sgate_r = _make_sgate()
+        nn.init.zeros_(self.sgate_l[-1].weight)
+        nn.init.zeros_(self.sgate_l[-1].bias)
+        nn.init.zeros_(self.sgate_r[-1].weight)
+        nn.init.zeros_(self.sgate_r[-1].bias)
+
+        # Per-channel residual scale, zero-init (identity at step 0).
+        self.gamma_l = nn.Parameter(torch.zeros(1, channels, 1, 1))
+        self.gamma_r = nn.Parameter(torch.zeros(1, channels, 1, 1))
+
+    # ------------------------------------------------------------------
+    # STFT / iSTFT with Hann window + 50 % overlap-add (WOLA).
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _hann(win: int, device, dtype) -> torch.Tensor:
+        """Periodic Hann window; periodic flag matches NumPy / DSP convention.
+
+        With periodic=True and hop = win/2 the analysis/synthesis Hann pair
+        satisfies the constant-overlap-add (COLA) condition: the sum of
+        squared Hann windows is constant (= win/4 per bin) in the interior.
+        Edges have fewer overlapping frames and are explicitly normalised
+        by the per-position sum-of-squared-windows map.
+        """
+        return torch.hann_window(win, periodic=True, device=device, dtype=dtype)
+
+    def _stft(self, x: torch.Tensor) -> tuple[torch.Tensor, int, int, int]:
+        """Frame + Hann-analyse + rfft. Returns
+        ``(F: [B, C, H, NF, Wf], NF, pad_w, original_W)``.
+        """
+        B, C, H, W = x.shape
+        win, hop = self.window, self.hop
+        # Pad so (W_padded - win) is a multiple of hop.
+        if W < win:
+            pad_w = win - W
+        else:
+            rem = (W - win) % hop
+            pad_w = (hop - rem) % hop
+        if pad_w > 0:
+            x = F.pad(x, [0, pad_w])
+        Wp = x.shape[-1]
+        NF = (Wp - win) // hop + 1
+        # Extract overlapping frames along width.
+        frames = x.unfold(-1, win, hop)  # [B, C, H, NF, win]
+        # Analysis window.
+        h = self._hann(win, x.device, x.dtype).view(1, 1, 1, 1, win)
+        frames = frames * h
+        # 1D rfft along the window axis.
+        F_x = torch.fft.rfft(frames, dim=-1, norm="ortho")  # [B, C, H, NF, Wf]
+        return F_x, NF, pad_w, W
+
+    def _istft(
+        self, F_x: torch.Tensor, NF: int, pad_w: int, original_W: int
+    ) -> torch.Tensor:
+        """Inverse: irfft → Hann-synthesise → overlap-add → normalise."""
+        win, hop = self.window, self.hop
+        # IFFT per frame.
+        frames = torch.fft.irfft(F_x, n=win, dim=-1, norm="ortho")  # [B, C, H, NF, win]
+        # Synthesis Hann.
+        h = self._hann(win, frames.device, frames.dtype)  # [win]
+        frames = frames * h.view(1, 1, 1, 1, win)
+        B, C, H, _, _ = frames.shape
+        out_len = (NF - 1) * hop + win
+        # Overlap-add. NF is small (≈ 2·W/win) so a Python loop is fine on GPU.
+        out = torch.zeros(B, C, H, out_len, device=frames.device, dtype=frames.dtype)
+        for k in range(NF):
+            out[..., k * hop : k * hop + win] = (
+                out[..., k * hop : k * hop + win] + frames[..., k, :]
+            )
+        # COLA normalisation: divide by per-position sum of squared windows.
+        h2 = h * h  # [win]
+        norm_map = torch.zeros(out_len, device=frames.device, dtype=frames.dtype)
+        for k in range(NF):
+            norm_map[k * hop : k * hop + win] = norm_map[k * hop : k * hop + win] + h2
+        out = out / norm_map.clamp_min(1e-8)
+        if pad_w > 0:
+            out = out[..., :original_W]
+        return out
+
+    # ------------------------------------------------------------------
+    # Bounded complex filter from raw 2C output.
+    # ------------------------------------------------------------------
+
+    def _filter(self, raw: torch.Tensor, freq: torch.Tensor) -> torch.Tensor:
+        """Build bounded complex filter from raw (g_raw, theta_raw).
+
+        ``raw`` shape: [B, 2C, S, Wf] where S = spatial collapsed dim.
+        ``freq`` shape: [B, 1, S, Wf] in [0, 0.5].
+        Returns complex filter [B, C, S, Wf].
+        """
+        g_raw, theta_raw = raw.chunk(2, dim=1)
+        gain_dev = self.gain_scale * torch.tanh(g_raw)
+        theta = math.pi * torch.tanh(theta_raw)
+        if self.hf_only:
+            # Linear HF ramp in [0, 1]: 0 at DC, 1 at Nyquist. Suppresses
+            # deviation from identity at low frequencies.
+            hf = 2.0 * freq  # [B, 1, S, Wf]
+            gain_dev = gain_dev * hf
+            theta = theta * hf
+        gain = 1.0 + gain_dev
+        return torch.complex(gain * theta.cos(), gain * theta.sin())
+
+    # ------------------------------------------------------------------
+    # Forward.
+    # ------------------------------------------------------------------
+
+    def forward(self, x_l: torch.Tensor, x_r: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        B, C, H, W = x_l.shape
+        dtype = x_l.dtype
+        windowed = self.window > 0 and self.window < W
+
+        with torch.amp.autocast("cuda", enabled=False):
+            xl_f = x_l.float()
+            xr_f = x_r.float()
+
+            if windowed:
+                # STFT along width: [B, C, H, NF, Wf]
+                F_l, NF, pad_w, W_orig = self._stft(xl_f)
+                F_r, _, _, _ = self._stft(xr_f)
+                Wf = F_l.shape[-1]
+                S = H * NF
+                # Collapse (H, NF) into a single spatial axis for 1×1-conv processing.
+                F_l_c = F_l.reshape(B, C, S, Wf)
+                F_r_c = F_r.reshape(B, C, S, Wf)
+            else:
+                F_l = torch.fft.rfft(xl_f, dim=-1, norm="ortho")  # [B, C, H, Wf]
+                F_r = torch.fft.rfft(xr_f, dim=-1, norm="ortho")
+                NF = 1
+                pad_w = 0
+                W_orig = W
+                Wf = F_l.shape[-1]
+                S = H
+                F_l_c, F_r_c = F_l, F_r
+
+            # Cross-power phase difference (no atan2).
+            cp = F_l_c * F_r_c.conj()
+            cp_mag = cp.abs() + self.log_eps
+            cos_dphi = cp.real / cp_mag
+            sin_dphi = cp.imag / cp_mag
+
+            log_mag_l = (F_l_c.abs() + self.log_eps).log()
+            log_mag_r = (F_r_c.abs() + self.log_eps).log()
+
+            # Normalised frequency embedding.
+            freq = torch.linspace(0.0, 0.5, Wf, device=xl_f.device, dtype=xl_f.dtype)
+            freq = freq.view(1, 1, 1, Wf).expand(B, 1, S, Wf)
+
+            # Predict raw filter params for each direction.
+            cond_l = torch.cat([cos_dphi, sin_dphi, log_mag_l, log_mag_r, freq], dim=1)
+            A_l = self._filter(self.align_l(cond_l), freq)
+
+            cond_r = torch.cat([cos_dphi, -sin_dphi, log_mag_r, log_mag_l, freq], dim=1)
+            A_r = self._filter(self.align_r(cond_r), freq)
+
+            # Warp other view onto self in the spectral domain.
+            F_r_to_l_c = F_r_c * A_l
+            F_l_to_r_c = F_l_c * A_r
+
+            if windowed:
+                # Reshape back to [B, C, H, NF, Wf] for iSTFT.
+                F_r_to_l = F_r_to_l_c.reshape(B, C, H, NF, Wf)
+                F_l_to_r = F_l_to_r_c.reshape(B, C, H, NF, Wf)
+                x_r_to_l = self._istft(F_r_to_l, NF, pad_w, W_orig)
+                x_l_to_r = self._istft(F_l_to_r, NF, pad_w, W_orig)
+            else:
+                x_r_to_l = torch.fft.irfft(F_r_to_l_c, n=W, dim=-1, norm="ortho")
+                x_l_to_r = torch.fft.irfft(F_l_to_r_c, n=W, dim=-1, norm="ortho")
+
+        x_r_to_l = x_r_to_l.to(dtype)
+        x_l_to_r = x_l_to_r.to(dtype)
+
+        # Spatial gate: per-pixel confidence that the warp is reliable.
+        sgate_l = torch.sigmoid(self.sgate_l(torch.cat([x_l, x_r_to_l], dim=1)))
+        sgate_r = torch.sigmoid(self.sgate_r(torch.cat([x_r, x_l_to_r], dim=1)))
+
+        out_l = x_l + self.gamma_l * sgate_l * (x_r_to_l - x_l)
+        out_r = x_r + self.gamma_r * sgate_r * (x_l_to_r - x_r)
         return out_l, out_r

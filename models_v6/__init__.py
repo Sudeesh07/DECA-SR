@@ -26,7 +26,15 @@ def build_model_v6(args: argparse.Namespace) -> StereoSRV6:
         use_cvsfm=not args.no_cvsfm,
         cvsfm_use_gate=not getattr(args, "cvsfm_no_gate", False),
         cvsfm_use_1d_fft=getattr(args, "cvsfm_1d_fft", False),
-        cvsfm_version="v2" if getattr(args, "cvsfm_v2", False) else "v1",
+        cvsfm_version=(
+            "v3" if getattr(args, "cvsfm_v3", False)
+            else "v2" if getattr(args, "cvsfm_v2", False)
+            else "v1"
+        ),
+        cvsfm_v3_window=getattr(args, "cvsfm_v3_window", 0),
+        cvsfm_v3_hf_only=getattr(args, "cvsfm_v3_hf_only", False),
+        cvsfm_v3_gain_scale=getattr(args, "cvsfm_v3_gain_scale", 0.1),
+        cvsfm_first=getattr(args, "cvsfm_first", False),
     )
 
 
