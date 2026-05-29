@@ -224,9 +224,11 @@ class StereoSRDataset(Dataset):
         pad_h = max(0, target_h - h)
         pad_w = max(0, target_w - w)
         if pad_h > 0 or pad_w > 0:
-            # Reflect requires pad < dim; fall back to replicate for large pads
+            # torchvision tensor pad accepts: 'constant', 'edge', 'reflect',
+            # 'symmetric'. Reflect requires pad < dim; fall back to edge
+            # (replicate) for large pads or degenerate single-pixel dims.
             can_reflect = pad_h < h and pad_w < w and h > 1 and w > 1
-            mode = "reflection" if can_reflect else "replicate"
+            mode = "reflect" if can_reflect else "edge"
             img = TF.pad(img, [0, 0, pad_w, pad_h], padding_mode=mode)
         return img
 
