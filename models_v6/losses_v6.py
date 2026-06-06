@@ -64,7 +64,7 @@ class SpectralConsistencyLoss(nn.Module):
         self.hf_emphasis = hf_emphasis
 
     def forward(self, sr_l: torch.Tensor, sr_r: torch.Tensor) -> torch.Tensor:
-        with torch.amp.autocast("cuda", enabled=False):
+        with torch.amp.autocast("cuda", en abled=False):
             Fl = torch.fft.rfft2(sr_l.float(), norm="ortho")
             Fr = torch.fft.rfft2(sr_r.float(), norm="ortho")
             diff = (Fl.abs() - Fr.abs()).abs()  # [B, C, H, W//2+1]
