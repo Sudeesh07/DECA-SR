@@ -364,8 +364,16 @@ def train(args):
     effective_bs = args.batch_size * world_size
     lr_scale = effective_bs / 8.0
     scaled_lr = args.lr * lr_scale
+    max_lr = getattr(args, "max_lr", 0.0)
+    capped = max_lr and max_lr > 0 and scaled_lr > max_lr
+    if capped:
+        scaled_lr = max_lr
     if is_main():
-        logger.info(f"LR scaling: base={args.lr:.2e} × {lr_scale:.1f} = {scaled_lr:.2e}")
+        logger.info(
+            f"LR scaling: base={args.lr:.2e} × {lr_scale:.1f} = "
+            f"{args.lr * lr_scale:.2e}"
+            + (f" -> capped to max_lr={max_lr:.2e}" if capped else "")
+        )
 
     optimizer = build_optimizer(
         model, scaled_lr, args.weight_decay, betas=(args.adam_beta1, args.adam_beta2)

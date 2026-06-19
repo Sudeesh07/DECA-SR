@@ -102,6 +102,22 @@ def vflip(lr_l, lr_r, hr_l, hr_r, prob: float = 0.5):
 # 4. Random horizontal shift (preserves disparity)
 # ---------------------------------------------------------------------------
 
+def _replicate_shift(x: torch.Tensor, shift: int) -> torch.Tensor:
+    """Horizontally shift ``x`` by ``shift`` px via edge replication (no wrap).
+
+    Positive ``shift`` moves content right; the exposed left band is filled by
+    replicating the left edge column. Output width is unchanged.
+    """
+    if shift == 0:
+        return x
+    w = x.shape[-1]
+    # 4D NCHW replicate padding takes a 4-tuple (left, right, top, bottom);
+    # pad width only, leave height untouched.
+    if shift > 0:
+        return F.pad(x, (shift, 0, 0, 0), mode="replicate")[..., :w]
+    return F.pad(x, (0, -shift, 0, 0), mode="replicate")[..., -w:]
+
+
 def hshift_same(lr_l, lr_r, hr_l, hr_r, scale: int, max_lr_shift: int = 8, prob: float = 0.5):
     """With probability ``prob``: shift L AND R by the SAME horizontal amount.
 
@@ -112,9 +128,13 @@ def hshift_same(lr_l, lr_r, hr_l, hr_r, scale: int, max_lr_shift: int = 8, prob:
 
     HR shift = LR shift × scale to preserve LR↔HR alignment.
 
-    Implementation uses circular ``torch.roll`` (rather than pad-crop) because
-    Flickr1024 patches are content-rich at edges, so a few-pixel wrap is a
-    smaller perturbation than zero-padding.
+    Implementation uses **replicate pad-crop** (not circular ``torch.roll``).
+    A circular roll joins the physically-discontinuous left/right edges, and the
+    model's bicubic global-residual skip interpolates across that join while the
+    rolled HR target carries genuine wrapped content — injecting a corrupted
+    gradient band at the wrap seam on every shifted batch. Replicate pad-crop
+    has no internal seam: the exposed edge is a constant replication in both LR
+    and HR, so ``bicubic(shift(LR))`` stays consistent with ``shift(HR)``.
     """
     if max_lr_shift <= 0 or random.random() >= prob:
         return lr_l, lr_r, hr_l, hr_r
@@ -123,10 +143,10 @@ def hshift_same(lr_l, lr_r, hr_l, hr_r, scale: int, max_lr_shift: int = 8, prob:
         return lr_l, lr_r, hr_l, hr_r
     shift_hr = shift_lr * scale
     return (
-        torch.roll(lr_l, shifts=shift_lr, dims=-1),
-        torch.roll(lr_r, shifts=shift_lr, dims=-1),
-        torch.roll(hr_l, shifts=shift_hr, dims=-1),
-        torch.roll(hr_r, shifts=shift_hr, dims=-1),
+        _replicate_shift(lr_l, shift_lr),
+        _replicate_shift(lr_r, shift_lr),
+        _replicate_shift(hr_l, shift_hr),
+        _replicate_shift(hr_r, shift_hr),
     )
 
 

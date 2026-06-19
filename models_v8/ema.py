@@ -59,10 +59,16 @@ class ModelEMA:
             p.requires_grad_(False)
 
     def _effective_decay(self) -> float:
-        """Effective decay this step, including warmup ramp."""
+        """Effective decay this step, ramped linearly from 0 to ``decay`` over
+        ``warmup_steps`` updates.
+
+        Early on the EMA tracks the (fast-moving) model closely; the cap by
+        ``self.decay`` means that once ``num_updates >= warmup_steps`` the
+        effective decay is exactly ``self.decay``.
+        """
         if self.warmup_steps <= 0:
             return self.decay
-        warm = self.num_updates / (self.num_updates + 10.0)
+        warm = self.num_updates / self.warmup_steps
         return min(self.decay, warm)
 
     @torch.no_grad()

@@ -79,6 +79,10 @@ def _add_common_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--total_iters", type=int, default=400000)
     parser.add_argument("--lr", type=float, default=2e-4,
                         help="Base LR before linear scaling by effective batch.")
+    parser.add_argument("--max_lr", type=float, default=1e-3,
+                        help="Hard ceiling on the batch-scaled LR. Guards against "
+                             "divergence at large effective batch (v6-small "
+                             "NaN-collapsed at 1.53e-3). Set <=0 to disable.")
     parser.add_argument("--weight_decay", type=float, default=0.0)
     parser.add_argument("--adam_beta1", type=float, default=0.9)
     parser.add_argument("--adam_beta2", type=float, default=0.9,
